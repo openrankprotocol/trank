@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""
+Telegram Channel Crawler
+Simple script to fetch and archive messages from Telegram channels.
+Uses phone number login (no session strings needed).
+"""
+
+import asyncio
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Generator, List, TypeVar, Union
+
+
+class DateTimeEncoder(json.JSONEncoder):
+    """Custom JSON encoder that handles datetime objects."""
+
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if isinstance(obj, bytes):
+            return obj.decode("utf-8", errors="ignore")
+        return super().default(obj)
+
+
+from dotenv import load_dotenv
+from telethon import TelegramClient
+from telethon.tl.types import Message
+
+# Load environment variables
+load_dotenv()
+
+# Use built-in tomllib for Python 3.11+, fallback to tomli for older versions
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        import toml as tomllib
+
+T = TypeVar("T")
+
+
+def load_config():
+    """Load configuration from config.toml"""
+    config_path = Path(__file__).parent / "config.toml"
+
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    # Load TOML file (always use binary mode for tomllib/tomli)
+    with open(config_path, "rb") as f:
+        return tomllib.load(f)
+
+
+def chunk_array(array: List[T], chunk_size: int) -> Generator[List[T], None, None]:
+    """Split an array into chunks of the specified size."""
+    for i in range(0, len(array), chunk_size):
+        yield array[i : i + chunk_size]
+
+
+async def fetch_channel_messages(client: TelegramClient, channel: int, config: dict):
+    """Fetch messages from a Telegram channel within the configured time window."""
+    crawler_config = config.get("crawler", {})
+    channels_config = config.get("channels", {})
+
+    # Check if channel is excluded
+    excluded_channels = channels_config.get("exclude", [])
+    if channel in excluded_channels:
+        print(f"⏭️  Skipping excluded channel: {channel}")
+        return {"channel": channel, "messages": [], "skipped": True}
+
+    time_window_days = crawler_config.get("time_window_days", 3)
+    max_messages = crawler_config.get("max_messages_per_channel", 2000)
+    rate_delay = crawler_config.get("rate_limiting_delay", 0.5)
+    batch_size = crawler_config.get(
+        "batch_size", 500
+    )  # Fetch messages in batches (default 500)
+
+    offset_date = datetime.now(timezone.utc) - timedelta(days=time_window_days)
+    messages_with_reactions: List[dict] = []
+    user_info: dict = {}  # Track user_id -> {username, first_name, last_name}
+
+    try:
+        print(f"📥 Fetching messages from {channel} in batches of {batch_size}...")
+        print(f"  ⏰ Time window: fetching messages since {offset_date.isoformat()}")
+
+        total_fetched = 0
+        batch_number = 1
+        offset_id = 0  # Start from the most recent message
+
+        while total_fetched < max_messages:
+            # Calculate how many messages to fetch in this batch
+            messages_to_fetch = min(batch_size, max_messages - total_fetched)
+
+            # Fetch a batch of messages (starting from most recent, going backwards)
+            batch_messages = await client.get_messages(
+                channel,
+                limit=messages_to_fetch,
+                offset_id=offset_id,
+            )
+
+            if not batch_messages:
+                # No more messages to fetch
+                break
+
+            print(f"  📦 Batch {batch_number}: Fetched {len(batch_messages)} messages")
+            if batch_messages:
+                first_msg_date = (
+                    batch_messages[0].date.isoformat()
+                    if batch_messages[0].date
+                    else "None"
+                )
+                last_msg_date = (
+                    batch_messages[-1].date.isoformat()
+                    if batch_messages[-1].date
+                    else "None"
+                )
+                print(f"     First message date: {first_msg_date}")
+                print(f"     Last message date: {last_msg_date}")
+
+            batch_processed_count = 0
+            reached_time_limit = False
+
+            for idx, message in enumerate(batch_messages, 1):
+                # Check if message is within time window
+                if message.date and message.date < offset_date:
+                    # We've gone past our time window, stop fetching
+                    print(
+                        f"  ⏹️  Reached end of time window at message {message.id} (date: {message.date.isoformat()})"
+                    )
+                    print(
+                        f"     Processed {batch_processed_count} messages from this batch before time limit"
+                    )
+                    reached_time_limit = True
+                    break
+
+                batch_processed_count += 1
+
+                # Collect user info from message sender
+                if message.from_id and hasattr(message.from_id, "user_id"):
+                    user_id = message.from_id.user_id
+                    if user_id not in user_info:
+                        try:
+                            user = await client.get_entity(user_id)
+                            user_info[user_id] = {
+                                "username": user.username or "",
+                                "first_name": user.first_name or "",
+                                "last_name": user.last_name or "",
+                            }
+                        except Exception:
+                            # If we can't get user info, just skip it
+                            pass
+
+                # Show progress for reactions fetching
+                if idx % 50 == 0 or idx == len(batch_messages):
+                    print(
+                        f"     Processing reactions: {idx}/{len(batch_messages)} messages..."
+                    )
+
+                # Fetch detailed reactions with user IDs for this message
+                reaction_details = []
+                if message.reactions and message.reactions.results:
+                    try:
+                        # Get message reactions with user details using GetMessageReactionsList
+                        from telethon.tl.functions.messages import (
+                            GetMessageReactionsListRequest,
+                        )
+
+                        for reaction_result in message.reactions.results:
+                            emoji = (
+                                reaction_result.reaction.emoticon
+                                if hasattr(reaction_result.reaction, "emoticon")
+                                else None
+                            )
+
+                            if emoji:
+                                # Get users who reacted with this specific emoji
+                                result = await client(
+                                    GetMessageReactionsListRequest(
+                                        peer=channel,
+                                        id=message.id,
+                                        reaction=reaction_result.reaction,
+                                        limit=100,
+                                    )
+                                )
+
+                                # Extract user IDs from the reaction list
+                                for reaction_peer in result.reactions:
+                                    user_id = (
+                                        reaction_peer.peer_id.user_id
+                                        if hasattr(reaction_peer.peer_id, "user_id")
+                                        else None
+                                    )
+                                    if user_id:
+                                        reaction_details.append(
+                                            {"user_id": user_id, "emoji": emoji}
+                                        )
+                                        # Collect user info from reactions
+                                        if user_id not in user_info:
+                                            try:
+                                                user = await client.get_entity(user_id)
+                                                user_info[user_id] = {
+                                                    "username": user.username or "",
+                                                    "first_name": user.first_name or "",
+                                                    "last_name": user.last_name or "",
+                                                }
+                                            except Exception:
+                                                pass
+                    except Exception as e:
+                        # Fallback to basic reaction without user IDs if detailed fetch fails
+                        for reaction_result in message.reactions.results:
+                            emoji = (
+                                reaction_result.reaction.emoticon
+                                if hasattr(reaction_result.reaction, "emoticon")
+                                else None
+                            )
+                            if emoji:
+                                reaction_details.append(
+                                    {
+                                        "user_id": None,
+                                        "emoji": emoji,
+                                        "count": reaction_result.count,
+                                    }
+                                )
+
+                messages_with_reactions.append(
+                    {"message": message, "reaction_details": reaction_details}
+                )
+
+            total_fetched += batch_processed_count
+
+            # If we reached the time limit, stop fetching more batches
+            if reached_time_limit:
+                break
+
+            # Rate limiting delay between batches
+            await asyncio.sleep(rate_delay)
+
+            # Update offset_id to the ID of the last (oldest) message in this batch
+            offset_id = batch_messages[-1].id
+            batch_number += 1
+
+            # If we got fewer messages than requested, we've reached the end
+            if len(batch_messages) < messages_to_fetch:
+                break
+
+        print(
+            f"✅ Fetched {len(messages_with_reactions)} messages from {channel} in {batch_number - 1} batches"
+        )
+        print(f"👥 Collected info for {len(user_info)} unique users")
+        return {
+            "channel": channel,
+            "messages": messages_with_reactions,
+            "user_info": user_info,
+            "skipped": False,
+        }
+
+    except Exception as e:
+        print(f"❌ Error fetching messages from {channel}: {e}")
+        return {"channel": channel, "messages": [], "error": str(e)}
+
+
+async def save_messages(results: list, config: dict):
+    """Save fetched messages to JSON files."""
+    output_config = config.get("output", {})
+    pretty_print = output_config.get("pretty_print", True)
+    indent_spaces = output_config.get("indent_spaces", 2)
+
+    # Create raw directory if it doesn't exist
+    output_dir = Path("raw")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for result in results:
+        # Skip excluded or errored channels
+        if result.get("skipped", False) or result.get("error"):
+            continue
+
+        # Save user info to CSV if available
+        user_info = result.get("user_info", {})
+        if user_info:
+            csv_filename = output_dir / f"{result['channel']}_user_ids.csv"
+            with open(csv_filename, "w", encoding="utf-8") as f:
+                f.write("user_id,username,first_name,last_name\n")
+                for user_id, info in sorted(user_info.items()):
+                    username = info.get("username", "")
+                    first_name = info.get("first_name", "").replace(",", " ")
+                    last_name = info.get("last_name", "").replace(",", " ")
+                    f.write(f"{user_id},{username},{first_name},{last_name}\n")
+            print(f"👥 Saved {len(user_info)} users to {csv_filename}")
+
+        # Convert messages to simplified format with only essential fields
+        serializable_messages = []
+        for msg_data in result["messages"]:
+            msg = msg_data["message"]
+            reaction_details = msg_data["reaction_details"]
+
+            # Extract only the fields we need
+            simplified_msg = {
+                "id": msg.id,
+                "date": msg.date.isoformat() if msg.date else None,
+                "from_id": msg.from_id.user_id
+                if hasattr(msg.from_id, "user_id")
+                else None,
+                "message": msg.message,
+                "reply_to_msg_id": msg.reply_to.reply_to_msg_id
+                if msg.reply_to
+                else None,
+                "reactions": reaction_details if reaction_details else [],
+                "replies": msg.replies.replies if msg.replies else None,
+            }
+
+            serializable_messages.append(simplified_msg)
+
+        # Save to raw directory with _messages.json suffix
+        filename = output_dir / f"{result['channel']}_messages.json"
+        indent = indent_spaces if pretty_print else None
+
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(
+                serializable_messages,
+                f,
+                indent=indent,
+                ensure_ascii=False,
+            )
+
+        print(f"💾 Saved {len(serializable_messages)} messages to {filename}")
+
+
+async def main():
+    """Main entry point for the Telegram crawler."""
+    print("🚀 Starting Telegram Channel Crawler\n")
+
+    # Load configuration
+    config = load_config()
+    crawler_config = config.get("crawler", {})
+    channels_config = config.get("channels", {})
+
+    # Get environment variables
+    api_id = int(os.getenv("TELEGRAM_APP_ID", "0"))
+    api_hash = os.getenv("TELEGRAM_APP_HASH", "")
+    phone = os.getenv("TELEGRAM_PHONE", "")
+
+    if not api_id or not api_hash:
+        print("❌ Error: Missing Telegram credentials in .env file")
+        print("Please set TELEGRAM_APP_ID and TELEGRAM_APP_HASH")
+        print("\nGet your credentials from: https://my.telegram.org")
+        sys.exit(1)
+
+    # Get channels to crawl (must be integers)
+    channels = channels_config.get("include", [])
+    if not channels:
+        print("❌ Error: No channels configured in config.toml")
+        sys.exit(1)
+
+    # Validate that all channels are integers
+    for ch in channels:
+        if not isinstance(ch, int):
+            print(f"❌ Error: Channel '{ch}' is not a valid ID (must be an integer)")
+            print("Use 'python list_channels.py' to see your channel IDs")
+            sys.exit(1)
+
+    parallel_requests = crawler_config.get("parallel_requests", 3)
+
+    # Initialize Telegram client with session file
+    session_file = "telegram_session"
+    client = TelegramClient(session_file, api_id, api_hash)
+
+    try:
+        print("🔌 Connecting to Telegram...")
+        await client.start(
+            phone=lambda: phone
+            or input(
+                "📱 Enter your phone number (with country code, e.g., +1234567890): "
+            ),
+            password=lambda: input("🔒 Enter your 2FA password (if enabled): "),
+            code_callback=lambda: input("💬 Enter the code Telegram sent you: "),
+        )
+
+        if not await client.is_user_authorized():
+            print("❌ Authorization failed. Please try again.")
+            sys.exit(1)
+
+        me = await client.get_me()
+        print(f"✅ Connected as: {me.first_name} (@{me.username or 'no username'})\n")
+
+        # Process channels in parallel batches
+        all_results = []
+
+        for chunk in chunk_array(channels, parallel_requests):
+            tasks = [
+                fetch_channel_messages(client, channel, config) for channel in chunk
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Separate successful results from errors
+            for result in results:
+                if isinstance(result, Exception):
+                    print(f"❌ Error: {result}")
+                else:
+                    all_results.append(result)
+
+        # Save all messages
+        print()
+        await save_messages(all_results, config)
+
+        print("\n✅ Crawling complete!")
+
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+        sys.exit(1)
+
+    finally:
+        if client.is_connected():
+            await client.disconnect()
+            print("🔌 Disconnected from Telegram")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n⚠️  Interrupted by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        sys.exit(1)

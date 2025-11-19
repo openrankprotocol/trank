@@ -1,0 +1,48 @@
+# Telegram Channel Crawler Configuration
+
+[crawler]
+# How many days back in time to look for messages
+time_window_days = 365
+
+# Maximum number of messages to fetch per channel
+max_messages_per_channel = 20000
+
+# Number of channels to process concurrently
+parallel_requests = 1
+
+# Number of messages to fetch per batch
+batch_size = 500
+
+# Delay between requests in seconds (helps avoid rate limiting)
+rate_limiting_delay = 0.5
+
+
+[channels]
+# List of channel IDs to crawl (must be numeric IDs, not usernames)
+# Use 'python list_channels.py' to see all your channels and their IDs
+include = [
+    1533865579,
+]
+
+# List of channel IDs to exclude from crawling
+# Useful for filtering out logs, bots, operational channels, etc.
+exclude = [
+    # -1001111111111,
+    # -1002222222222,
+]
+
+
+[output]
+# Pretty print JSON output (uses indentation)
+pretty_print = true
+
+# JSON indentation spaces (only used if pretty_print is true)
+indent_spaces = 2
+
+# Note: Messages are saved to raw/[channel_id]_messages.json
+
+[trust]
+# Trust scoring values
+mention_points = 50      # Points for direct mentions
+reply_points = 40        # Points for replies
+reaction_points = 30     # Points for reactions
