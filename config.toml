@@ -5,7 +5,7 @@
 time_window_days = 365
 
 # Maximum number of messages to fetch per channel
-max_messages_per_channel = 20000
+max_messages_per_channel = 40000
 
 # Number of channels to process concurrently
 parallel_requests = 1
@@ -16,12 +16,16 @@ batch_size = 500
 # Delay between requests in seconds (helps avoid rate limiting)
 rate_limiting_delay = 0.5
 
+# Save checkpoint every N messages (0 to disable checkpoints)
+# Checkpoints allow resuming if the script is interrupted
+checkpoint_interval = 2000
+
 
 [channels]
 # List of channel IDs to crawl (must be numeric IDs, not usernames)
 # Use 'python list_channels.py' to see all your channels and their IDs
 include = [
-    1533865579,
+    1242127973,
 ]
 
 # List of channel IDs to exclude from crawling

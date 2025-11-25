@@ -2,30 +2,30 @@
 """
 Score Processing Script
 
-This script processes trust score files from the scores/ directory by:
-1. Loading all CSV trust files (i,j,v format)
+This script processes trust score files from the trust/ directory by:
+1. Loading all CSV trust files (i,j,v format with user IDs)
 2. Aggregating scores by user (summing incoming trust)
 3. Normalizing scores to 0-1000 range while preserving relative differences
 4. Sorting by score (descending)
 5. Saving results to output/ directory
 
 Usage:
-    python3 process_scores.py              # Process with usernames in output
-    python3 process_scores.py --with-user-ids  # Output user IDs instead of usernames
+    python3 process_scores.py
 
 Note: The --log, --sqrt, and --quantile flags are kept for backwards compatibility
 but all now apply the same linear normalization to preserve relative score differences.
 
 Requirements:
     - pandas (install with: pip install pandas)
-    - CSV files in scores/ directory with columns 'i', 'v'
+    - CSV files in trust/ directory with columns 'i', 'j', 'v'
 
 Output:
     - Creates output/ directory if it doesn't exist
     - For each input file (e.g., 4886853134.csv), creates:
-      - output/4886853134.csv with normalized scores
+      - output/4886853134.csv with normalized scores (user IDs only)
     - Scores are normalized to 0-1000 range, preserving relative differences
     - Sorted by score (descending)
+    - User ID to username mapping is done in generate_json.py
 """
 
 import argparse
@@ -35,53 +35,25 @@ from pathlib import Path
 import pandas as pd
 
 
-def load_user_ids_mapping(channel_id):
-    """
-    Load user ID to username mapping from raw/[channel_id]_user_ids.csv
-
-    Args:
-        channel_id: Channel ID
-
-    Returns:
-        dict: Mapping of username to user_id, or empty dict if file not found
-    """
-    try:
-        mapping_file = Path(f"raw/{channel_id}_user_ids.csv")
-
-        if not mapping_file.exists():
-            print(f"    ⚠️  Warning: {mapping_file} not found")
-            return {}
-
-        print(f"    📋 Loading user mapping from: {mapping_file}")
-
-        # Load as dataframe
-        mapping_df = pd.read_csv(mapping_file)
-
-        # Create dictionary mapping username -> user_id
-        username_to_id = dict(
-            zip(mapping_df["username"], mapping_df["user_id"].astype(str))
-        )
-
-        print(f"    ✅ Loaded {len(username_to_id)} username mappings")
-        return username_to_id
-
-    except Exception as e:
-        print(f"    ⚠️  Warning: Could not load user mapping: {str(e)}")
-        return {}
-
-
 def aggregate_scores(df):
     """
-    Scores are already aggregated in the scores/ directory - just return as is
+    Aggregate trust scores by summing incoming trust.
+
+    Processes raw trust edges (i -> j with value v) and calculates
+    total incoming trust for each user by summing all edges where
+    they are the recipient (j column).
 
     Args:
-        df: DataFrame with columns i, v (user -> value)
+        df: DataFrame with columns i, j, v (from_user_id -> to_user_id -> score)
 
     Returns:
-        DataFrame with columns i (user) and v (total trust score)
+        DataFrame with columns i (user_id) and v (total incoming trust score)
     """
-    # Scores are already aggregated, no need to group
-    return df
+    # Sum all incoming trust for each user (group by j column)
+    # j is the recipient of trust, so we aggregate by j
+    aggregated = df.groupby("j")["v"].sum().reset_index()
+    aggregated.columns = ["i", "v"]  # Rename j to i for consistency
+    return aggregated
 
 
 def apply_log_transformation(df):
@@ -147,9 +119,7 @@ def apply_quantile_transformation(df):
     return df_transformed
 
 
-def process_trust_file(
-    input_file, output_dir, transform_func, transform_name, with_user_ids=False
-):
+def process_trust_file(input_file, output_dir, transform_func, transform_name):
     """
     Process a single trust file by aggregating, transforming, and saving
 
@@ -158,7 +128,6 @@ def process_trust_file(
         output_dir: Directory to save processed files
         transform_func: Transformation function to apply
         transform_name: Name of the transformation
-        with_user_ids: Whether to output user IDs instead of usernames
     """
     # Extract channel ID from filename
     channel_id = Path(input_file).stem
@@ -169,34 +138,25 @@ def process_trust_file(
     print(f"Transformation: {transform_name}")
     print(f"{'=' * 80}")
 
-    # Load the scores CSV file (i,v format - already aggregated)
+    # Load the trust CSV file (i,j,v format - raw edges)
     df = pd.read_csv(input_file)
-    print(f"✅ Loaded {len(df)} users with scores")
+    print(f"✅ Loaded {len(df)} trust edges")
 
-    # Scores are already aggregated, just pass through
+    # Aggregate scores by summing incoming trust
     aggregated = aggregate_scores(df)
+    print(f"✅ Aggregated to {len(aggregated)} users with incoming trust scores")
 
-    # If --with-user-ids flag is passed, convert usernames to user IDs
-    if with_user_ids:
-        username_to_id = load_user_ids_mapping(channel_id)
-        if username_to_id:
-            # Map usernames to user IDs
-            aggregated["i"] = (
-                aggregated["i"].map(username_to_id).fillna(aggregated["i"])  # type: ignore[arg-type]
-            )
-            converted_count = sum(
-                1 for user in df["j"].unique() if user in username_to_id
-            )
-            print(f"✅ Converted {converted_count} usernames to user IDs")
-        else:
-            print(f"⚠️  No user ID mapping found, keeping usernames")
+    # Keep user IDs as-is (no conversion to usernames)
+    # Username mapping will be done in generate_json.py
+    print("📋 Keeping user IDs in output")
 
     # Apply normalization
     transformed = transform_func(aggregated.copy())
     print(f"✅ Applied linear normalization (preserving relative differences)")
 
-    # Don't sort - preserve the order from the trust file
-    # The trust file is already sorted by the trust score generation algorithm
+    # Sort by score (descending) - highest scores first
+    transformed = transformed.sort_values("v", ascending=False)
+    print(f"✅ Sorted by score (highest to lowest)")
 
     # Generate output file name
     output_file = output_dir / f"{channel_id}.csv"
@@ -209,7 +169,7 @@ def process_trust_file(
     score_max = transformed["v"].max() if len(transformed) > 0 else 0
     score_mean = transformed["v"].mean() if len(transformed) > 0 else 0
 
-    print(f"📊 Statistics:")
+    print("📊 Statistics:")
     print(f"   Users: {len(transformed)}")
     print(f"   Score range: {score_min:.2f} - {score_max:.2f}")
     print(f"   Mean score: {score_mean:.2f}")
@@ -234,11 +194,7 @@ def main():
         action="store_true",
         help="(Deprecated) Same as default - preserves relative differences",
     )
-    parser.add_argument(
-        "--with-user-ids",
-        action="store_true",
-        help="Output user IDs instead of usernames (requires user_ids.csv)",
-    )
+
     args = parser.parse_args()
 
     # All methods now use the same linear normalization
@@ -248,32 +204,30 @@ def main():
 
     print("📊 Trust Score Processing")
     print("Normalization: Linear (0-1000 range, preserving relative differences)")
-    print(f"Output format: {'user IDs' if args.with_user_ids else 'usernames'}")
+    print("Output format: user IDs (username mapping done in generate_json.py)")
     print()
 
     # Define directories
-    scores_dir = Path("scores")
+    scores_dir = Path("trust")
     output_dir = Path("output")
 
     # Ensure output directory exists
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find all CSV files in the scores directory
+    # Find all CSV files in the trust directory
     csv_files = list(scores_dir.glob("*.csv"))
 
     if not csv_files:
-        print(f"❌ No CSV files found in {scores_dir} directory")
-        print(f"   Run 'python generate_trust.py' first to create scores")
+        print("❌ No CSV files found in {} directory".format(scores_dir))
+        print(f"   Run 'python generate_trust.py' first to create trust files")
         sys.exit(1)
 
-    print(f"Found {len(csv_files)} score file(s) to process...")
+    print(f"Found {len(csv_files)} trust file(s) to process...")
 
     # Process each CSV file
     for csv_file in csv_files:
         try:
-            process_trust_file(
-                csv_file, output_dir, transform_func, transform_name, args.with_user_ids
-            )
+            process_trust_file(csv_file, output_dir, transform_func, transform_name)
         except Exception as e:
             print(f"❌ Error processing {csv_file}: {str(e)}")
             import traceback

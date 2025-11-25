@@ -42,47 +42,100 @@ def load_messages(channel_id):
 
 
 def load_user_ids_mapping(channel_id):
-    """Load user ID to username mapping from CSV"""
+    """
+    Load user ID to display name mapping from CSV.
+
+    Creates a mapping where each user_id maps to the best available display name.
+    Display name fallback priority:
+      1. username (e.g., "john_doe") - if user has set a Telegram username
+      2. "first_name last_name" (e.g., "John Doe") - constructed from profile names
+      3. user_id as string - fallback if no other info available
+
+    Args:
+        channel_id: Channel ID to load user mapping for
+
+    Returns:
+        dict: Mapping of user_id (int) -> display_name (str)
+              Empty dict if mapping file not found
+    """
     user_ids_file = Path(__file__).parent / "raw" / f"{channel_id}_user_ids.csv"
 
     if not user_ids_file.exists():
         print(f"⚠️  Warning: User IDs mapping not found: {user_ids_file}")
-        print(f"   Run 'python get_user_ids.py' to create it")
+        print(f"   This is optional but recommended for better user identification")
         return {}
 
     mapping = {}
     with open(user_ids_file, "r", encoding="utf-8") as f:
-        # Skip header
+        # Skip header: user_id,username,first_name,last_name
         next(f)
         for line in f:
             parts = line.strip().split(",")
-            if len(parts) >= 2:
+            if len(parts) >= 4:
                 user_id = int(parts[0])
-                username = parts[1]
-                if username:  # Only map if username exists
-                    mapping[user_id] = username
+                username = parts[1].strip()
+                first_name = parts[2].strip()
+                last_name = parts[3].strip()
+
+                # Display name priority: username > full name > user_id
+                # Note: Not all Telegram users have usernames (it's optional)
+                if username:
+                    # Best case: user has a username like @john_doe
+                    display_name = username
+                elif first_name or last_name:
+                    # Fallback: construct name from first/last name
+                    display_name = f"{first_name} {last_name}".strip()
+                else:
+                    # Last resort: use user_id as identifier
+                    display_name = str(user_id)
+
+                mapping[user_id] = display_name
 
     return mapping
 
 
-def extract_mentions(text):
-    """Extract @mentions from message text"""
+def extract_mentioned_user_ids(text, user_id_to_display):
+    """
+    Extract mentioned user IDs from @mentions in message text.
+
+    Args:
+        text: Message text to search for mentions
+        user_id_to_display: Mapping of user_id -> display_name
+
+    Returns:
+        list: List of user IDs that were mentioned
+    """
     if not text:
         return []
 
-    mentions = []
+    # Create reverse mapping: display_name -> user_id
+    display_to_user_id = {display: uid for uid, display in user_id_to_display.items()}
+
+    mentioned_ids = []
     words = text.split()
     for word in words:
         if word.startswith("@") and len(word) > 1:
             username = word[1:].strip(",.!?;:")
-            mentions.append(username)
+            # Try to find user ID for this username
+            if username in display_to_user_id:
+                mentioned_ids.append(display_to_user_id[username])
 
-    return mentions
+    return mentioned_ids
 
 
-def calculate_trust_scores(messages, weights):
-    """Calculate trust scores between users based on interactions"""
-    # Store trust scores: (user_i, user_j) -> total_score
+def calculate_trust_scores(messages, weights, user_id_to_display):
+    """
+    Calculate trust scores between users based on interactions.
+
+    Args:
+        messages: List of message objects
+        weights: Dictionary of weight values from config
+        user_id_to_display: Mapping of user_id -> display_name (for mentions)
+
+    Returns:
+        defaultdict: Trust scores mapping (user_i_id, user_j_id) -> total_score
+    """
+    # Store trust scores: (user_i_id, user_j_id) -> total_score
     trust_scores = defaultdict(float)
 
     reaction_weight = weights.get(
@@ -104,7 +157,7 @@ def calculate_trust_scores(messages, weights):
         for reaction in reactions:
             reactor_id = reaction.get("user_id")
             if reactor_id and reactor_id != msg_author:
-                # Trust edge: reactor -> msg_author
+                # Trust edge: reactor -> msg_author (using user IDs)
                 trust_scores[(reactor_id, msg_author)] += reaction_weight
 
         # Process replies: replier -> original message author
@@ -113,22 +166,33 @@ def calculate_trust_scores(messages, weights):
             original_msg = message_lookup[reply_to_id]
             original_author = original_msg.get("from_id")
             if original_author and original_author != msg_author:
-                # Trust edge: msg_author -> original_author
+                # Trust edge: msg_author -> original_author (using user IDs)
                 trust_scores[(msg_author, original_author)] += reply_weight
 
         # Process mentions: mentioner -> mentioned user
         message_text = msg.get("message", "")
-        mentions = extract_mentions(message_text)
-        for mentioned_username in mentions:
-            # Store as username since we don't have user_id mapping here
-            # Trust edge: msg_author -> mentioned_username
-            trust_scores[(msg_author, mentioned_username)] += mention_weight
+        mentioned_user_ids = extract_mentioned_user_ids(
+            message_text, user_id_to_display
+        )
+        for mentioned_user_id in mentioned_user_ids:
+            if mentioned_user_id != msg_author:
+                # Trust edge: msg_author -> mentioned_user_id (using user IDs)
+                trust_scores[(msg_author, mentioned_user_id)] += mention_weight
 
     return trust_scores
 
 
-def save_trust_csv(channel_id, trust_scores, user_id_to_username):
-    """Save trust scores to CSV file in trust/ directory"""
+def save_trust_csv(channel_id, trust_scores):
+    """
+    Save trust scores to CSV file in trust/ directory with user IDs.
+
+    Args:
+        channel_id: Channel ID
+        trust_scores: Dictionary mapping (user_i_id, user_j_id) -> score
+
+    Returns:
+        tuple: (output_file_path, edge_count)
+    """
     # Create trust directory if it doesn't exist
     trust_dir = Path(__file__).parent / "trust"
     trust_dir.mkdir(parents=True, exist_ok=True)
@@ -137,34 +201,20 @@ def save_trust_csv(channel_id, trust_scores, user_id_to_username):
 
     # Aggregate scores by (i, j) pairs
     aggregated = defaultdict(float)
-    skipped_no_username = 0
 
-    for (user_i, user_j), score in trust_scores.items():
-        # Convert user IDs to usernames if available
-        # Only include if BOTH users have usernames
-        username_i = user_id_to_username.get(user_i)
-        username_j = user_id_to_username.get(user_j)
-
-        # Skip if either user doesn't have a username
-        if not username_i or not username_j:
-            skipped_no_username += 1
-            continue
-
+    for (user_i_id, user_j_id), score in trust_scores.items():
         # Skip if same user
-        if username_i == username_j:
+        if user_i_id == user_j_id:
             continue
 
-        # Aggregate scores for unique (i, j) pairs
-        aggregated[(username_i, username_j)] += score
+        # Aggregate scores for unique (i, j) pairs using user IDs
+        aggregated[(user_i_id, user_j_id)] += score
 
-    # Write to CSV
+    # Write to CSV with user IDs
     with open(output_file, "w", encoding="utf-8") as f:
         f.write("i,j,v\n")
-        for (user_i, user_j), score in sorted(aggregated.items()):
-            f.write(f"{user_i},{user_j},{score}\n")
-
-    if skipped_no_username > 0:
-        print(f"⚠️  Skipped {skipped_no_username} edges with missing usernames")
+        for (user_i_id, user_j_id), score in sorted(aggregated.items()):
+            f.write(f"{user_i_id},{user_j_id},{score}\n")
 
     return output_file, len(aggregated)
 
@@ -215,21 +265,19 @@ def main():
             messages = load_messages(channel_id)
             print(f"✅ Loaded {len(messages)} messages")
 
-            # Load user ID to username mapping from CSV
-            user_id_to_username = load_user_ids_mapping(channel_id)
-            if user_id_to_username:
-                print(f"✅ Loaded {len(user_id_to_username)} user ID mappings")
-            else:
-                print(f"⚠️  No user ID mappings found - output will be empty")
+            # Load user ID to display name mapping from CSV (optional, for mentions)
+            user_id_to_display = load_user_ids_mapping(channel_id)
+            if user_id_to_display:
+                print(f"✅ Loaded {len(user_id_to_display)} user ID mappings")
 
-            # Calculate trust scores
-            trust_scores = calculate_trust_scores(messages, trust_config)
+            # Calculate trust scores (now using user IDs)
+            trust_scores = calculate_trust_scores(
+                messages, trust_config, user_id_to_display
+            )
             print(f"✅ Calculated {len(trust_scores)} trust edges")
 
-            # Save to CSV
-            output_file, edge_count = save_trust_csv(
-                channel_id, trust_scores, user_id_to_username
-            )
+            # Save to CSV with user IDs
+            output_file, edge_count = save_trust_csv(channel_id, trust_scores)
             print(f"💾 Saved {edge_count} aggregated edges to {output_file}")
             print()
 

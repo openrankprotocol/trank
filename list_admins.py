@@ -2,9 +2,11 @@
 """
 List Channel/Group Admins and Roles
 Shows all owners, admins, and moderators for channels/groups in config.toml
+Saves admin lists to raw/[channel_id]_admins.csv
 """
 
 import asyncio
+import csv
 import os
 import sys
 from pathlib import Path
@@ -236,11 +238,66 @@ async def get_channel_admins(client: TelegramClient, channel_id: int):
         print(f"📊 Summary: {owner_count} owner(s), {admin_count} admin(s)")
         print(f"Total: {len(admin_list)} staff member(s)\n")
 
-        return {"channel_id": channel_id, "title": entity.title, "admins": admin_list}
+        return {
+            "channel_id": channel_id,
+            "title": entity.title,
+            "admins": admin_list,
+            "username": username if username else "",
+        }
 
     except Exception as e:
         print(f"❌ Error getting admins for {channel_id}: {e}\n")
         return {"channel_id": channel_id, "error": str(e)}
+
+
+def save_admins_to_csv(results):
+    """Save admin lists to CSV files in raw/ directory"""
+    # Create raw directory if it doesn't exist
+    output_dir = Path("raw")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for result in results:
+        # Skip if there was an error
+        if "error" in result or not result.get("admins"):
+            continue
+
+        channel_id = result["channel_id"]
+        admins = result["admins"]
+
+        # Save to CSV
+        csv_filename = output_dir / f"{channel_id}_admins.csv"
+        with open(csv_filename, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "user_id",
+                    "username",
+                    "first_name",
+                    "last_name",
+                ]
+            )
+
+            for admin in admins:
+                # Split full name into first and last name
+                full_name = admin["name"]
+                name_parts = full_name.split(None, 1) if full_name else []
+                first_name = name_parts[0] if len(name_parts) > 0 else ""
+                last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+                username = admin["username"] if admin["username"] else ""
+
+                writer.writerow(
+                    [
+                        admin["user_id"],
+                        username,
+                        first_name,
+                        last_name,
+                    ]
+                )
+
+        print(f"💾 Saved {len(admins)} admin(s) to {csv_filename}")
+
+    print()
 
 
 async def main():
@@ -319,7 +376,13 @@ async def main():
         total_admins = sum(len(r.get("admins", [])) for r in all_results)
         print(f"\nTotal admins across all channels: {total_admins}")
 
-        print("\n✅ Done!\n")
+        # Save all admin lists to CSV files
+        print("\n" + "=" * 80)
+        print("💾 SAVING TO FILES")
+        print("=" * 80 + "\n")
+        save_admins_to_csv(all_results)
+
+        print("✅ Done!\n")
 
     except Exception as e:
         print(f"❌ Fatal error: {e}")

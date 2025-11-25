@@ -148,6 +148,7 @@ scores/**
 trust/**
 ui/**
 output/**
+tmp/**
 
 # IDE
 .vscode/

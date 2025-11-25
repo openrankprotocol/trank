@@ -62,6 +62,49 @@ def chunk_array(array: List[T], chunk_size: int) -> Generator[List[T], None, Non
         yield array[i : i + chunk_size]
 
 
+def save_checkpoint(channel: int, messages: List[dict], user_info: dict, config: dict):
+    """Save checkpoint data to resume processing if interrupted."""
+    checkpoint_dir = Path("raw/checkpoints")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_file = checkpoint_dir / f"{channel}_checkpoint.json"
+
+    output_config = config.get("output", {})
+    indent_spaces = output_config.get("indent_spaces", 2)
+
+    checkpoint_data = {
+        "channel": channel,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "message_count": len(messages),
+        "last_message_id": messages[-1]["id"] if messages else None,
+        "messages": messages,
+        "user_info": user_info,
+    }
+
+    with open(checkpoint_file, "w", encoding="utf-8") as f:
+        json.dump(checkpoint_data, f, indent=indent_spaces, ensure_ascii=False)
+
+    print(f"💾 Checkpoint saved: {len(messages)} messages to {checkpoint_file}")
+
+
+def load_checkpoint(channel: int) -> dict:
+    """Load checkpoint data if it exists."""
+    checkpoint_file = Path("raw/checkpoints") / f"{channel}_checkpoint.json"
+
+    if checkpoint_file.exists():
+        with open(checkpoint_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+def clear_checkpoint(channel: int):
+    """Remove checkpoint file after successful completion."""
+    checkpoint_file = Path("raw/checkpoints") / f"{channel}_checkpoint.json"
+    if checkpoint_file.exists():
+        checkpoint_file.unlink()
+        print(f"🗑️  Checkpoint cleared for channel {channel}")
+
+
 async def fetch_channel_messages(client: TelegramClient, channel: int, config: dict):
     """Fetch messages from a Telegram channel within the configured time window."""
     crawler_config = config.get("crawler", {})
@@ -79,18 +122,46 @@ async def fetch_channel_messages(client: TelegramClient, channel: int, config: d
     batch_size = crawler_config.get(
         "batch_size", 500
     )  # Fetch messages in batches (default 500)
+    checkpoint_interval = crawler_config.get(
+        "checkpoint_interval", 100
+    )  # Save every N messages
 
     offset_date = datetime.now(timezone.utc) - timedelta(days=time_window_days)
-    messages_with_reactions: List[dict] = []
-    user_info: dict = {}  # Track user_id -> {username, first_name, last_name}
+
+    # Check for existing checkpoint
+    checkpoint = load_checkpoint(channel)
+    if checkpoint:
+        print(
+            f"📂 Found checkpoint for channel {channel} with {checkpoint['message_count']} messages"
+        )
+        print(f"   Last saved: {checkpoint['timestamp']}")
+        resume = input("   Resume from checkpoint? (y/n): ").strip().lower()
+        if resume == "y":
+            messages_with_reactions = checkpoint["messages"]
+            user_info = checkpoint["user_info"]
+            offset_id = checkpoint["last_message_id"]
+            total_fetched = len(messages_with_reactions)
+            print(f"✅ Resuming from message ID {offset_id}")
+        else:
+            messages_with_reactions = []
+            user_info = {}
+            offset_id = 0
+            total_fetched = 0
+            clear_checkpoint(channel)
+    else:
+        messages_with_reactions = []
+        user_info = {}  # Track user_id -> {username, first_name, last_name}
+        offset_id = 0
+        total_fetched = 0
 
     try:
         print(f"📥 Fetching messages from {channel} in batches of {batch_size}...")
         print(f"  ⏰ Time window: fetching messages since {offset_date.isoformat()}")
 
-        total_fetched = 0
-        batch_number = 1
-        offset_id = 0  # Start from the most recent message
+        if offset_id > 0:
+            batch_number = (total_fetched // batch_size) + 1
+        else:
+            batch_number = 1
 
         while total_fetched < max_messages:
             # Calculate how many messages to fetch in this batch
@@ -227,11 +298,28 @@ async def fetch_channel_messages(client: TelegramClient, channel: int, config: d
                                     }
                                 )
 
-                messages_with_reactions.append(
-                    {"message": message, "reaction_details": reaction_details}
-                )
+                # Convert message to simplified format immediately for checkpoint
+                simplified_msg = {
+                    "id": message.id,
+                    "date": message.date.isoformat() if message.date else None,
+                    "from_id": message.from_id.user_id
+                    if hasattr(message.from_id, "user_id")
+                    else None,
+                    "message": message.message,
+                    "reply_to_msg_id": message.reply_to.reply_to_msg_id
+                    if message.reply_to
+                    else None,
+                    "reactions": reaction_details if reaction_details else [],
+                    "replies": message.replies.replies if message.replies else None,
+                }
+
+                messages_with_reactions.append(simplified_msg)
 
             total_fetched += batch_processed_count
+
+            # Save checkpoint periodically
+            if checkpoint_interval > 0 and total_fetched % checkpoint_interval == 0:
+                save_checkpoint(channel, messages_with_reactions, user_info, config)
 
             # If we reached the time limit, stop fetching more batches
             if reached_time_limit:
@@ -249,9 +337,13 @@ async def fetch_channel_messages(client: TelegramClient, channel: int, config: d
                 break
 
         print(
-            f"✅ Fetched {len(messages_with_reactions)} messages from {channel} in {batch_number - 1} batches"
+            f"✅ Fetched {len(messages_with_reactions)} messages from {channel} in {batch_number} batches"
         )
         print(f"👥 Collected info for {len(user_info)} unique users")
+
+        # Clear checkpoint after successful completion
+        clear_checkpoint(channel)
+
         return {
             "channel": channel,
             "messages": messages_with_reactions,
@@ -292,28 +384,8 @@ async def save_messages(results: list, config: dict):
                     f.write(f"{user_id},{username},{first_name},{last_name}\n")
             print(f"👥 Saved {len(user_info)} users to {csv_filename}")
 
-        # Convert messages to simplified format with only essential fields
-        serializable_messages = []
-        for msg_data in result["messages"]:
-            msg = msg_data["message"]
-            reaction_details = msg_data["reaction_details"]
-
-            # Extract only the fields we need
-            simplified_msg = {
-                "id": msg.id,
-                "date": msg.date.isoformat() if msg.date else None,
-                "from_id": msg.from_id.user_id
-                if hasattr(msg.from_id, "user_id")
-                else None,
-                "message": msg.message,
-                "reply_to_msg_id": msg.reply_to.reply_to_msg_id
-                if msg.reply_to
-                else None,
-                "reactions": reaction_details if reaction_details else [],
-                "replies": msg.replies.replies if msg.replies else None,
-            }
-
-            serializable_messages.append(simplified_msg)
+        # Messages are already in simplified format from fetch_channel_messages
+        serializable_messages = result["messages"]
 
         # Save to raw directory with _messages.json suffix
         filename = output_dir / f"{result['channel']}_messages.json"
