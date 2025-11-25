@@ -20,12 +20,20 @@ rate_limiting_delay = 0.5
 # Checkpoints allow resuming if the script is interrupted
 checkpoint_interval = 2000
 
+# Fetch replies/comments to channel posts (true/false)
+# For channels with discussion groups, this fetches all replies to posts
+fetch_replies = true
+
+# Maximum depth for nested replies (0 = no replies, 1 = direct replies only, 2 = replies to replies, etc.)
+# Higher values fetch more nested conversations but take longer
+max_reply_depth = 4
+
 
 [channels]
 # List of channel IDs to crawl (must be numeric IDs, not usernames)
 # Use 'python list_channels.py' to see all your channels and their IDs
 include = [
-    1242127973,
+    2468695644,
 ]
 
 # List of channel IDs to exclude from crawling

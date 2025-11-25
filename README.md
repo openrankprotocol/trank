@@ -95,6 +95,8 @@ parallel_requests = 3             # Concurrent channels to process
 batch_size = 500                  # Number of messages to fetch per batch
 rate_limiting_delay = 0.5         # Delay between requests (seconds)
 checkpoint_interval = 100         # Save checkpoint every N messages (0 to disable)
+fetch_replies = true              # Fetch replies/comments to channel posts
+max_reply_depth = 2               # Maximum depth for nested replies (0-5 recommended)
 
 [channels]
 include = [-1001234567890, -1003198190559]  # Channel IDs to crawl
@@ -166,7 +168,20 @@ Each JSON file contains an array of simplified message objects with only essenti
 - `message` - Message text content
 - `reply_to_msg_id` - ID of message being replied to (if any)
 - `reactions` - Array of reactions with user ID and emoji
-- `replies` - Number of replies to this message
+- `replies_count` - Number of replies to this message
+- `replies_data` - Array of reply messages (if `fetch_replies = true`)
+
+**For channels with replies enabled:**
+When `fetch_replies = true` in config, each post will include a `replies_data` array containing all replies/comments with their reactions and user information. This is useful for channels with discussion groups enabled.
+
+**Nested replies:**
+Replies can have their own replies (threaded conversations). The `max_reply_depth` setting controls how many levels deep to fetch:
+- `0` = No replies fetched
+- `1` = Only direct replies to posts
+- `2` = Replies + replies to those replies (recommended)
+- `3+` = Deeper nesting (slower, more data)
+
+Each reply in `replies_data` can contain its own `replies_data` array for nested conversations.
 
 ## Files
 
@@ -227,6 +242,9 @@ python login.py
 
 **Authorization failed**
 → Make sure you enter the correct phone number and verification code
+
+**"Collected info for 0 unique users" for channel posts**
+→ This is normal for channels (not groups). Set `fetch_replies = true` in config.toml to fetch comments/replies where user interactions happen.
 
 ## Admin Listing
 
