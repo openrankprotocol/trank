@@ -2,30 +2,30 @@
 """
 Score Processing Script
 
-This script processes trust score files from the trust/ directory by:
-1. Loading all CSV trust files (i,j,v format with user IDs)
-2. Aggregating scores by user (summing incoming trust)
+This script processes pre-aggregated score files from the scores/ directory by:
+1. Loading all CSV score files (i,v format - username/user_id, score)
+2. Optionally excluding admins (with --members-only flag)
 3. Normalizing scores to 0-1000 range while preserving relative differences
 4. Sorting by score (descending)
 5. Saving results to output/ directory
 
 Usage:
     python3 process_scores.py
+    python3 process_scores.py --members-only  # Exclude admins from scores
 
 Note: The --log, --sqrt, and --quantile flags are kept for backwards compatibility
 but all now apply the same linear normalization to preserve relative score differences.
 
 Requirements:
     - pandas (install with: pip install pandas)
-    - CSV files in trust/ directory with columns 'i', 'j', 'v'
+    - CSV files in scores/ directory with columns 'i', 'v'
 
 Output:
     - Creates output/ directory if it doesn't exist
     - For each input file (e.g., 4886853134.csv), creates:
-      - output/4886853134.csv with normalized scores (user IDs only)
+      - output/4886853134.csv with normalized scores
     - Scores are normalized to 0-1000 range, preserving relative differences
     - Sorted by score (descending)
-    - User ID to username mapping is done in generate_json.py
 """
 
 import argparse
@@ -33,27 +33,6 @@ import sys
 from pathlib import Path
 
 import pandas as pd
-
-
-def aggregate_scores(df):
-    """
-    Aggregate trust scores by summing incoming trust.
-
-    Processes raw trust edges (i -> j with value v) and calculates
-    total incoming trust for each user by summing all edges where
-    they are the recipient (j column).
-
-    Args:
-        df: DataFrame with columns i, j, v (from_user_id -> to_user_id -> score)
-
-    Returns:
-        DataFrame with columns i (user_id) and v (total incoming trust score)
-    """
-    # Sum all incoming trust for each user (group by j column)
-    # j is the recipient of trust, so we aggregate by j
-    aggregated = df.groupby("j")["v"].sum().reset_index()
-    aggregated.columns = ["i", "v"]  # Rename j to i for consistency
-    return aggregated
 
 
 def apply_log_transformation(df):
@@ -119,15 +98,48 @@ def apply_quantile_transformation(df):
     return df_transformed
 
 
-def process_trust_file(input_file, output_dir, transform_func, transform_name):
+def load_admin_ids(channel_id):
     """
-    Process a single trust file by aggregating, transforming, and saving
+    Load admin user IDs from raw/[channel_id]_admins.csv
+
+    Args:
+        channel_id: Channel ID to load admins for
+
+    Returns:
+        set: Set of admin user IDs (as strings for comparison)
+    """
+    admins_file = Path("raw") / f"{channel_id}_admins.csv"
+
+    if not admins_file.exists():
+        print(f"⚠️  Warning: Admins file not found: {admins_file}")
+        return set()
+
+    admin_ids = set()
+    with open(admins_file, "r", encoding="utf-8") as f:
+        # Skip header: user_id,username,first_name,last_name
+        next(f)
+        for line in f:
+            parts = line.strip().split(",")
+            if len(parts) >= 1:
+                user_id = parts[0].strip()
+                if user_id:
+                    admin_ids.add(user_id)
+
+    return admin_ids
+
+
+def process_score_file(
+    input_file, output_dir, transform_func, transform_name, members_only=False
+):
+    """
+    Process a single score file by normalizing and saving
 
     Args:
         input_file: Path to input CSV file
         output_dir: Directory to save processed files
         transform_func: Transformation function to apply
         transform_name: Name of the transformation
+        members_only: If True, exclude admins from scores
     """
     # Extract channel ID from filename
     channel_id = Path(input_file).stem
@@ -136,22 +148,28 @@ def process_trust_file(input_file, output_dir, transform_func, transform_name):
     print(f"Processing: {input_file}")
     print(f"Channel ID: {channel_id}")
     print(f"Transformation: {transform_name}")
+    if members_only:
+        print(f"Mode: Members only (excluding admins)")
     print(f"{'=' * 80}")
 
-    # Load the trust CSV file (i,j,v format - raw edges)
+    # Load the score CSV file (i,v format - pre-aggregated scores)
     df = pd.read_csv(input_file)
-    print(f"✅ Loaded {len(df)} trust edges")
+    print(f"✅ Loaded {len(df)} user scores")
 
-    # Aggregate scores by summing incoming trust
-    aggregated = aggregate_scores(df)
-    print(f"✅ Aggregated to {len(aggregated)} users with incoming trust scores")
-
-    # Keep user IDs as-is (no conversion to usernames)
-    # Username mapping will be done in generate_json.py
-    print("📋 Keeping user IDs in output")
+    # Exclude admins if --members-only flag is set
+    if members_only:
+        admin_ids = load_admin_ids(channel_id)
+        if admin_ids:
+            # Convert 'i' column to string for comparison
+            original_count = len(df)
+            df = df[~df["i"].astype(str).isin(admin_ids)]
+            excluded_count = original_count - len(df)
+            print(f"✅ Excluded {excluded_count} admins, {len(df)} members remaining")
+        else:
+            print(f"⚠️  No admins to exclude")
 
     # Apply normalization
-    transformed = transform_func(aggregated.copy())
+    transformed = transform_func(df.copy())
     print(f"✅ Applied linear normalization (preserving relative differences)")
 
     # Sort by score (descending) - highest scores first
@@ -194,6 +212,11 @@ def main():
         action="store_true",
         help="(Deprecated) Same as default - preserves relative differences",
     )
+    parser.add_argument(
+        "--members-only",
+        action="store_true",
+        help="Exclude admins from scores (loads from raw/[channel_id]_admins.csv)",
+    )
 
     args = parser.parse_args()
 
@@ -208,7 +231,7 @@ def main():
     print()
 
     # Define directories
-    scores_dir = Path("trust")
+    scores_dir = Path("scores")
     output_dir = Path("output")
 
     # Ensure output directory exists
@@ -219,15 +242,17 @@ def main():
 
     if not csv_files:
         print("❌ No CSV files found in {} directory".format(scores_dir))
-        print(f"   Run 'python generate_trust.py' first to create trust files")
+        print(f"   Make sure score files exist in the scores/ directory")
         sys.exit(1)
 
-    print(f"Found {len(csv_files)} trust file(s) to process...")
+    print(f"Found {len(csv_files)} score file(s) to process...")
 
     # Process each CSV file
     for csv_file in csv_files:
         try:
-            process_trust_file(csv_file, output_dir, transform_func, transform_name)
+            process_score_file(
+                csv_file, output_dir, transform_func, transform_name, args.members_only
+            )
         except Exception as e:
             print(f"❌ Error processing {csv_file}: {str(e)}")
             import traceback

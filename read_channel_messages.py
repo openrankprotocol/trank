@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Generator, List, TypeVar, Union
 
+from telethon.tl.functions.messages import GetRepliesRequest
+
 
 class DateTimeEncoder(json.JSONEncoder):
     """Custom JSON encoder that handles datetime objects."""
@@ -105,6 +107,165 @@ def clear_checkpoint(channel: int):
         print(f"🗑️  Checkpoint cleared for channel {channel}")
 
 
+async def fetch_replies_for_post(
+    client: TelegramClient,
+    channel: int,
+    post_id: int,
+    user_info: dict,
+    rate_delay: float,
+) -> list:
+    """
+    Fetch all replies to a channel post using GetRepliesRequest with pagination.
+
+    This is the proper way to get replies to channel posts that have
+    linked discussion groups.
+
+    Args:
+        client: Telegram client
+        channel: Channel ID
+        post_id: ID of the channel post to fetch replies for
+        user_info: Dictionary to collect user info into
+        rate_delay: Delay between requests
+
+    Returns:
+        list: List of reply messages (flat, not nested)
+    """
+    replies_list = []
+    offset_id = 0
+    batch_size = 100
+
+    try:
+        while True:
+            result = await client(
+                GetRepliesRequest(
+                    peer=channel,
+                    msg_id=post_id,
+                    offset_id=offset_id,
+                    offset_date=None,
+                    add_offset=0,
+                    limit=batch_size,
+                    max_id=0,
+                    min_id=0,
+                    hash=0,
+                )
+            )
+
+            messages = result.messages
+            if not messages:
+                break
+
+            print(
+                f"     └─ Fetched {len(messages)} replies (total so far: {len(replies_list) + len(messages)})"
+            )
+
+            for msg in messages:
+                # Collect user info from reply sender
+                if msg.from_id and hasattr(msg.from_id, "user_id"):
+                    reply_user_id = msg.from_id.user_id
+                    if reply_user_id not in user_info:
+                        try:
+                            user = await client.get_entity(reply_user_id)
+                            user_info[reply_user_id] = {
+                                "username": user.username or "",
+                                "first_name": user.first_name or "",
+                                "last_name": user.last_name or "",
+                            }
+                        except Exception:
+                            pass
+
+                # Get reactions for this reply
+                reply_reactions = []
+                if msg.reactions and msg.reactions.results:
+                    try:
+                        from telethon.tl.functions.messages import (
+                            GetMessageReactionsListRequest,
+                        )
+
+                        for reaction_result in msg.reactions.results:
+                            emoji = (
+                                reaction_result.reaction.emoticon
+                                if hasattr(reaction_result.reaction, "emoticon")
+                                else None
+                            )
+                            if emoji:
+                                react_result = await client(
+                                    GetMessageReactionsListRequest(
+                                        peer=channel,
+                                        id=msg.id,
+                                        reaction=reaction_result.reaction,
+                                        limit=100,
+                                    )
+                                )
+                                for reaction_peer in react_result.reactions:
+                                    reactor_id = (
+                                        reaction_peer.peer_id.user_id
+                                        if hasattr(reaction_peer.peer_id, "user_id")
+                                        else None
+                                    )
+                                    if reactor_id:
+                                        reply_reactions.append(
+                                            {"user_id": reactor_id, "emoji": emoji}
+                                        )
+                                        if reactor_id not in user_info:
+                                            try:
+                                                user = await client.get_entity(
+                                                    reactor_id
+                                                )
+                                                user_info[reactor_id] = {
+                                                    "username": user.username or "",
+                                                    "first_name": user.first_name or "",
+                                                    "last_name": user.last_name or "",
+                                                }
+                                            except Exception:
+                                                pass
+                    except Exception:
+                        # Fallback to basic reaction info
+                        for reaction_result in msg.reactions.results:
+                            emoji = (
+                                reaction_result.reaction.emoticon
+                                if hasattr(reaction_result.reaction, "emoticon")
+                                else None
+                            )
+                            if emoji:
+                                reply_reactions.append(
+                                    {
+                                        "user_id": None,
+                                        "emoji": emoji,
+                                        "count": reaction_result.count,
+                                    }
+                                )
+
+                replies_list.append(
+                    {
+                        "id": msg.id,
+                        "date": msg.date.isoformat() if msg.date else None,
+                        "from_id": msg.from_id.user_id
+                        if msg.from_id and hasattr(msg.from_id, "user_id")
+                        else None,
+                        "message": msg.message,
+                        "reply_to_msg_id": msg.reply_to.reply_to_msg_id
+                        if msg.reply_to
+                        else None,
+                        "reactions": reply_reactions,
+                        "replies_count": 0,
+                        "replies_data": [],
+                    }
+                )
+
+            # If we got fewer than batch_size, we've reached the end
+            if len(messages) < batch_size:
+                break
+
+            # Set offset_id to oldest message id for next batch
+            offset_id = messages[-1].id
+            await asyncio.sleep(rate_delay)
+
+    except Exception as e:
+        print(f"     ⚠️  Error fetching replies for post {post_id}: {e}")
+
+    return replies_list
+
+
 async def fetch_replies_recursive(
     client: TelegramClient,
     channel: int,
@@ -117,6 +278,9 @@ async def fetch_replies_recursive(
 ) -> list:
     """
     Recursively fetch replies to a message, up to max_depth levels.
+
+    NOTE: For channel posts (depth 0), use fetch_replies_for_post instead.
+    This function is for nested replies within discussion threads.
 
     Args:
         client: Telegram client
@@ -140,34 +304,45 @@ async def fetch_replies_recursive(
         # Use discussion group if available, otherwise use channel
         peer = discussion_group if discussion_group else channel
 
-        # Get replies to this message
+        # Get ALL replies to this message with pagination
+        all_replies = []
+        offset_id = 0
+        batch_size = 100
+
         try:
-            replies = await client.get_messages(peer, reply_to=message_id, limit=100)
+            while True:
+                replies = await client.get_messages(
+                    peer,
+                    reply_to=message_id,
+                    limit=batch_size,
+                    offset_id=offset_id,
+                )
+
+                if not replies:
+                    break
+
+                all_replies.extend(replies)
+
+                # If we got fewer than batch_size, we've reached the end
+                if len(replies) < batch_size:
+                    break
+
+                # Set offset_id to oldest message id for next batch
+                offset_id = replies[-1].id
+                await asyncio.sleep(rate_delay)  # Rate limiting between pagination
 
         except Exception as e:
             # If reply_to fails, silently skip (deleted messages, gaps in IDs, etc.)
             if "invalid" in str(e).lower():
-                # For depth 0 (direct replies to channel posts), try alternative method
-                # Fetch recent messages and filter by those replying to this channel
-                if current_depth == 0 and discussion_group:
-                    return await fetch_channel_post_replies(
-                        client,
-                        channel,
-                        message_id,
-                        user_info,
-                        rate_delay,
-                        max_depth,
-                        discussion_group,
-                    )
                 return []
             raise
 
-        if replies:
+        if all_replies:
             print(
-                f"     {'  ' * current_depth}└─ Found {len(replies)} replies at depth {current_depth}"
+                f"     {'  ' * current_depth}└─ Found {len(all_replies)} replies at depth {current_depth}"
             )
 
-        for reply in replies:
+        for reply in all_replies:
             if not reply:
                 continue
 
@@ -301,140 +476,6 @@ async def fetch_replies_recursive(
             print(
                 f"     {'  ' * current_depth}⚠️  Could not fetch replies for message {message_id}: {e}"
             )
-
-    return replies_list
-
-
-async def fetch_channel_post_replies(
-    client: TelegramClient,
-    channel: int,
-    post_id: int,
-    user_info: dict,
-    rate_delay: float,
-    max_depth: int,
-    discussion_group: int,
-) -> list:
-    """
-    Fetch ALL messages from discussion group - they are all replies to channel posts.
-
-    Discussion groups only exist for channel comments, so all messages there
-    are replies to channel posts.
-    """
-    replies_list = []
-
-    try:
-        # Get ALL messages from discussion group (up to 1000)
-        # Since discussion groups only contain replies to channel posts,
-        # we treat all messages as replies
-        messages = await client.get_messages(discussion_group, limit=1000)
-        print(f"     └─ Fetched {len(messages)} total messages from discussion group")
-
-        # Process ALL messages as replies
-        for msg in messages:
-            # Collect user info from message author
-            if msg.from_id and hasattr(msg.from_id, "user_id"):
-                reply_user_id = msg.from_id.user_id
-                if reply_user_id not in user_info:
-                    try:
-                        user = await client.get_entity(reply_user_id)
-                        user_info[reply_user_id] = {
-                            "username": user.username or "",
-                            "first_name": user.first_name or "",
-                            "last_name": user.last_name or "",
-                        }
-                    except Exception:
-                        pass
-
-            # Get reactions for this message
-            reply_reactions = []
-            if msg.reactions and msg.reactions.results:
-                try:
-                    from telethon.tl.functions.messages import (
-                        GetMessageReactionsListRequest,
-                    )
-
-                    for reaction_result in msg.reactions.results:
-                        emoji = (
-                            reaction_result.reaction.emoticon
-                            if hasattr(reaction_result.reaction, "emoticon")
-                            else None
-                        )
-                        if emoji:
-                            result = await client(
-                                GetMessageReactionsListRequest(
-                                    peer=discussion_group,
-                                    id=msg.id,
-                                    reaction=reaction_result.reaction,
-                                    limit=100,
-                                )
-                            )
-                            for reaction_peer in result.reactions:
-                                reactor_id = (
-                                    reaction_peer.peer_id.user_id
-                                    if hasattr(reaction_peer.peer_id, "user_id")
-                                    else None
-                                )
-                                if reactor_id:
-                                    reply_reactions.append(
-                                        {
-                                            "user_id": reactor_id,
-                                            "emoji": emoji,
-                                        }
-                                    )
-                                    # Collect user info
-                                    if reactor_id not in user_info:
-                                        try:
-                                            user = await client.get_entity(reactor_id)
-                                            user_info[reactor_id] = {
-                                                "username": user.username or "",
-                                                "first_name": user.first_name or "",
-                                                "last_name": user.last_name or "",
-                                            }
-                                        except Exception:
-                                            pass
-                except Exception:
-                    # Fallback to basic reaction info
-                    for reaction_result in msg.reactions.results:
-                        emoji = (
-                            reaction_result.reaction.emoticon
-                            if hasattr(reaction_result.reaction, "emoticon")
-                            else None
-                        )
-                        if emoji:
-                            reply_reactions.append(
-                                {
-                                    "user_id": None,
-                                    "emoji": emoji,
-                                    "count": reaction_result.count,
-                                }
-                            )
-
-            # Add all messages to replies_list
-            replies_list.append(
-                {
-                    "id": msg.id,
-                    "date": msg.date.isoformat() if msg.date else None,
-                    "from_id": msg.from_id.user_id
-                    if hasattr(msg.from_id, "user_id")
-                    else None,
-                    "message": msg.message,
-                    "reply_to_msg_id": msg.reply_to.reply_to_msg_id
-                    if msg.reply_to
-                    else None,
-                    "reactions": reply_reactions,
-                    "replies_count": 0,  # We're getting all messages flat
-                    "replies_data": [],  # No nested structure for now
-                }
-            )
-
-        print(
-            f"     └─ Collected {len(replies_list)} messages as replies (all messages from discussion group)"
-        )
-
-        await asyncio.sleep(rate_delay)
-
-    except Exception as e:
-        print(f"     ⚠️  Could not fetch discussion group messages: {e}")
 
     return replies_list
 
@@ -580,15 +621,14 @@ async def fetch_channel_messages(client: TelegramClient, channel: int, config: d
                 post_replies = []
                 if fetch_replies and message.replies and message.replies.replies > 0:
                     try:
-                        post_replies = await fetch_replies_recursive(
+                        # Use GetRepliesRequest for channel posts - this properly
+                        # fetches all replies in the discussion thread
+                        post_replies = await fetch_replies_for_post(
                             client,
                             channel,
                             message.id,
                             user_info,
                             rate_delay,
-                            current_depth=0,
-                            max_depth=max_reply_depth,
-                            discussion_group=discussion_group,
                         )
                     except Exception as e:
                         print(
