@@ -5,28 +5,19 @@ Generate JSON files for UI from seed and output data.
 This script:
 1. Loads all entries from seed/ directory
 2. Loads corresponding score files from output/ directory
-3. Loads user mappings from raw/[channel_id]_user_ids.csv and raw/[channel_id]_admins.csv
-4. Optionally converts user IDs to display names (username > "first last" > user_id)
-5. Creates JSON files for each channel with format:
-   {
-     "category": "socialrank",
-     "channel": "<channel_id>",
-     "seed": [{"i": "peer_id", "v": value}, ...],
-     "scores": [{"i": "peer_id", "v": value}, ...]
-   }
-6. Saves JSON files to ui/ directory
+3. Loads user mappings from raw/[channel_id]_user_ids.csv
+4. Calculates user stats from raw/[channel_id]_messages.json
+5. Creates JSON files for each channel with enriched user data
 
 Usage:
-    python3 generate_json.py                 # Convert to display names (default)
-    python3 generate_json.py --with-user-ids # Keep user IDs
+    python3 generate_json.py
 
 Requirements:
     - pandas (install with: pip install pandas)
     - CSV files in seed/ directory
     - CSV files in output/ directory (matching seed filenames)
-    - CSV files in raw/ directory:
-      - [channel_id]_user_ids.csv (regular users)
-      - [channel_id]_admins.csv (admins - optional)
+    - CSV files in raw/ directory: [channel_id]_user_ids.csv
+    - JSON files in raw/ directory: [channel_id]_messages.json
 
 Output:
     - Creates ui/ directory if it doesn't exist
@@ -34,274 +25,274 @@ Output:
       - ui/1533865579.json with seed and score data
 """
 
-import argparse
 import json
+from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
 
 
-def get_channel_id(filename):
+def load_user_info(channel_id):
     """
-    Get channel ID from filename.
+    Load user info from CSV file.
 
     Args:
-        filename (str): Base filename without extension
+        channel_id: Channel ID to load user info for
 
     Returns:
-        str: Channel ID
+        dict: Mapping of user_id (str) -> {username, display_name, bio}
     """
-    # Return the filename as-is (it's already the channel ID)
-    return filename
+    user_info = {}
 
-
-def load_user_ids_mapping(channel_id):
-    """
-    Load user ID to display name mapping from CSV files.
-
-    Loads both user_ids.csv and admins.csv (if available) to create complete mapping.
-    Admin mappings will override regular user mappings if both exist.
-    Display name fallback priority:
-      1. username (e.g., "john_doe") - if user has set a Telegram username
-      2. "first_name last_name" (e.g., "John Doe") - constructed from profile names
-      3. user_id as string - fallback if no other info available
-
-    Args:
-        channel_id: Channel ID to load user mapping for
-
-    Returns:
-        dict: Mapping of user_id (str) -> display_name (str)
-              Empty dict if mapping file not found
-    """
-    user_id_to_display = {}
-
-    # Load regular users from user_ids.csv
     try:
         mapping_file = Path(f"raw/{channel_id}_user_ids.csv")
 
         if mapping_file.exists():
-            print(f"  📋 Loading user mapping from: {mapping_file}")
-
-            # Load as dataframe
+            print(f"  📋 Loading user info from: {mapping_file}")
             mapping_df = pd.read_csv(mapping_file)
 
-            # Create dictionary mapping user_id -> display_name
-            # Display name priority: username > full name > user_id
-            # Note: Not all Telegram users have usernames (it's optional)
             for _, row in mapping_df.iterrows():
                 user_id = str(row["user_id"])
 
-                # Extract username (may be empty/NaN)
+                # Extract username
                 username = ""
-                if pd.notna(row["username"]):
-                    username_val = row["username"]
-                    if username_val:
-                        username = str(username_val).strip()
+                if pd.notna(row.get("username")):
+                    username = str(row["username"]).strip()
 
-                # Extract first name (may be empty/NaN)
+                # Extract first name
                 first_name = ""
-                if pd.notna(row["first_name"]):
-                    first_name_val = row["first_name"]
-                    if first_name_val:
-                        first_name = str(first_name_val).strip()
+                if pd.notna(row.get("first_name")):
+                    first_name = str(row["first_name"]).strip()
 
-                # Extract last name (may be empty/NaN)
+                # Extract last name
                 last_name = ""
-                if pd.notna(row["last_name"]):
-                    last_name_val = row["last_name"]
-                    if last_name_val:
-                        last_name = str(last_name_val).strip()
+                if pd.notna(row.get("last_name")):
+                    last_name = str(row["last_name"]).strip()
 
-                # Determine best display name using priority fallback
-                if username:
-                    # Best case: user has a username like @john_doe
-                    display_name = username
-                elif first_name or last_name:
-                    # Fallback: construct name from first/last name
+                # Extract bio
+                bio = ""
+                if pd.notna(row.get("bio")):
+                    bio = str(row["bio"]).strip()
+
+                # Build display name: "first last" or username or user_id
+                if first_name or last_name:
                     display_name = f"{first_name} {last_name}".strip()
+                elif username:
+                    display_name = username
                 else:
-                    # Last resort: use user_id as identifier
                     display_name = user_id
 
-                user_id_to_display[user_id] = display_name
+                user_info[user_id] = {
+                    "username": username,
+                    "display_name": display_name,
+                    "bio": bio,
+                }
 
-            print(f"  ✅ Loaded {len(user_id_to_display)} user ID mappings")
+            print(f"  ✅ Loaded {len(user_info)} user info entries")
         else:
             print(f"  ⚠️  Warning: {mapping_file} not found")
 
     except Exception as e:
-        print(f"  ⚠️  Warning: Could not load user mapping: {str(e)}")
+        print(f"  ⚠️  Warning: Could not load user info: {str(e)}")
 
-    # Load admins from admins.csv and add/override mappings
-    try:
-        admins_file = Path(f"raw/{channel_id}_admins.csv")
-
-        if admins_file.exists():
-            print(f"  📋 Loading admin mapping from: {admins_file}")
-
-            # Load as dataframe
-            admins_df = pd.read_csv(admins_file)
-
-            admin_count = 0
-            for _, row in admins_df.iterrows():
-                user_id = str(row["user_id"])
-
-                # Extract username (may be empty/NaN)
-                username = ""
-                if pd.notna(row["username"]):
-                    username_val = row["username"]
-                    if username_val:
-                        username = str(username_val).strip()
-
-                # Extract first name (may be empty/NaN)
-                first_name = ""
-                if pd.notna(row["first_name"]):
-                    first_name_val = row["first_name"]
-                    if first_name_val:
-                        first_name = str(first_name_val).strip()
-
-                # Extract last name (may be empty/NaN)
-                last_name = ""
-                if pd.notna(row["last_name"]):
-                    last_name_val = row["last_name"]
-                    if last_name_val:
-                        last_name = str(last_name_val).strip()
-
-                # Determine best display name using priority fallback
-                if username:
-                    display_name = username
-                elif first_name or last_name:
-                    display_name = f"{first_name} {last_name}".strip()
-                else:
-                    display_name = user_id
-
-                user_id_to_display[user_id] = display_name
-                admin_count += 1
-
-            print(f"  ✅ Loaded {admin_count} admin mappings")
-        else:
-            print(f"  ℹ️  No admin file found: {admins_file}")
-
-    except Exception as e:
-        print(f"  ⚠️  Warning: Could not load admin mapping: {str(e)}")
-
-    if not user_id_to_display:
-        print(f"  ⚠️  No user mappings found, keeping user IDs")
-
-    return user_id_to_display
+    return user_info
 
 
-def convert_ids_to_display_names(data, user_id_mapping):
+def calculate_user_stats(channel_id):
     """
-    Convert user IDs to display names in data.
+    Calculate user stats from messages JSON file.
+
+    Stats calculated per user:
+    - num_posts: Number of messages/replies posted
+    - num_received_reactions: Total reactions received on their messages
+    - num_received_replies: Total replies under all messages authored by this user
+    - num_given_reactions: Number of reactions they gave
+    - num_given_replies: Number of replies they made
 
     Args:
-        data (list): List of dictionaries with 'i' (user_id) and 'v' (value) keys
-        user_id_mapping (dict): Mapping of user_id -> display_name
+        channel_id: Channel ID to calculate stats for
 
     Returns:
-        list: Data with user IDs converted to display names
+        dict: Mapping of user_id (str) -> stats dict
     """
-    if not user_id_mapping:
-        return data
+    stats = defaultdict(
+        lambda: {
+            "num_posts": 0,
+            "num_received_reactions": 0,
+            "num_received_replies": 0,
+            "num_given_reactions": 0,
+            "num_given_replies": 0,
+        }
+    )
 
-    converted_data = []
-    for entry in data:
-        user_id = str(entry["i"])
-        display_name = user_id_mapping.get(user_id, user_id)
-        converted_data.append({"i": display_name, "v": entry["v"]})
+    messages_file = Path(f"raw/{channel_id}_messages.json")
 
-    return converted_data
+    if not messages_file.exists():
+        print(f"  ⚠️  Warning: {messages_file} not found, stats will be empty")
+        return dict(stats)
+
+    try:
+        print(f"  📊 Calculating stats from: {messages_file}")
+
+        with open(messages_file, "r", encoding="utf-8") as f:
+            messages = json.load(f)
+
+        # First pass: build message_id -> author_id map and collect all messages
+        message_authors = {}
+        all_messages = []
+
+        def collect_messages(msg):
+            """Collect all messages and build author map."""
+            msg_id = msg.get("id")
+            author_id = msg.get("from_id")
+            if msg_id and author_id:
+                message_authors[msg_id] = str(author_id)
+            all_messages.append(msg)
+            for reply in msg.get("replies_data", []):
+                collect_messages(reply)
+
+        for msg in messages:
+            collect_messages(msg)
+
+        # Second pass: calculate stats
+        for msg in all_messages:
+            author_id = msg.get("from_id")
+            is_reply = msg.get("reply_to_msg_id") is not None or any(
+                msg.get("id") in [r.get("id") for r in m.get("replies_data", [])]
+                for m in messages
+            )
+
+            if author_id:
+                author_id = str(author_id)
+                # Count post
+                stats[author_id]["num_posts"] += 1
+
+                # If this message is a reply (has reply_to_msg_id), increment given_replies
+                if msg.get("reply_to_msg_id") is not None:
+                    stats[author_id]["num_given_replies"] += 1
+
+            # Process reactions on this message
+            reactions = msg.get("reactions", [])
+            for reaction in reactions:
+                reactor_id = reaction.get("user_id")
+                if reactor_id:
+                    reactor_id = str(reactor_id)
+                    stats[reactor_id]["num_given_reactions"] += 1
+
+                # Count received reactions for message author
+                if author_id:
+                    # Handle reactions with count field (aggregated)
+                    count = reaction.get("count", 1)
+                    stats[author_id]["num_received_reactions"] += count
+
+            # Track received replies via reply_to_msg_id
+            reply_to_id = msg.get("reply_to_msg_id")
+            if reply_to_id and reply_to_id in message_authors:
+                target_author = message_authors[reply_to_id]
+                # Don't count self-replies
+                if author_id and author_id != target_author:
+                    stats[target_author]["num_received_replies"] += 1
+
+        # Also count replies_data as received_replies for the parent message author
+        def count_direct_replies(msg):
+            author_id = msg.get("from_id")
+            if author_id:
+                author_id = str(author_id)
+                for reply in msg.get("replies_data", []):
+                    reply_author = reply.get("from_id")
+                    if reply_author and str(reply_author) != author_id:
+                        stats[author_id]["num_received_replies"] += 1
+                    count_direct_replies(reply)
+
+        for msg in messages:
+            count_direct_replies(msg)
+
+        print(f"  ✅ Calculated stats for {len(stats)} users")
+
+    except Exception as e:
+        print(f"  ⚠️  Warning: Could not calculate stats: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
+
+    return dict(stats)
 
 
 def load_seed_data(seed_file):
-    """
-    Load all entries from seed file.
-
-    Args:
-        seed_file (Path): Path to seed CSV file
-
-    Returns:
-        list: List of dictionaries with 'i' and 'v' keys
-    """
+    """Load all entries from seed file."""
     df = pd.read_csv(seed_file)
-
-    # Convert to list of dictionaries
-    seed_data = df.to_dict("records")
-
-    return seed_data
+    return df.to_dict("records")
 
 
 def load_scores(scores_file):
-    """
-    Load scores from output file.
-
-    Args:
-        scores_file (Path): Path to scores CSV file
-
-    Returns:
-        list: List of dictionaries with 'i' and 'v' keys
-    """
+    """Load scores from output file."""
     if not scores_file.exists():
-        print(f"Warning: {scores_file} not found, using empty scores")
+        print(f"  ⚠️  Warning: {scores_file} not found, using empty scores")
         return []
 
     df = pd.read_csv(scores_file)
-
-    # Convert to list of dictionaries
-    scores_data = df.to_dict("records")
-
-    return scores_data
+    return df.to_dict("records")
 
 
-def generate_json_file(ecosystem_name, seed_data, scores_data, output_file):
+def enrich_data(data, user_info, user_stats):
     """
-    Generate JSON file with seed and scores data.
+    Enrich data entries with user info and stats.
 
     Args:
-        ecosystem_name (str): Name of the ecosystem
-        seed_data (list): List of seed entries
-        scores_data (list): List of score entries
-        output_file (Path): Path to output JSON file
+        data: List of dicts with 'i' (user_id) and 'v' (value)
+        user_info: Dict mapping user_id -> {username, display_name, bio}
+        user_stats: Dict mapping user_id -> stats
+
+    Returns:
+        List of enriched entries
     """
+    enriched = []
+
+    for entry in data:
+        user_id = str(entry["i"])
+        info = user_info.get(user_id, {})
+        stats = user_stats.get(user_id, {})
+
+        enriched_entry = {
+            "i": user_id,
+            "v": entry["v"],
+            "username": info.get("username", ""),
+            "display_name": info.get("display_name", user_id),
+            "bio": info.get("bio", ""),
+            "num_posts": stats.get("num_posts", 0),
+            "num_received_reactions": stats.get("num_received_reactions", 0),
+            "num_received_replies": stats.get("num_received_replies", 0),
+            "num_given_reactions": stats.get("num_given_reactions", 0),
+            "num_given_replies": stats.get("num_given_replies", 0),
+        }
+
+        enriched.append(enriched_entry)
+
+    return enriched
+
+
+def generate_json_file(channel_id, seed_data, scores_data, output_file):
+    """Generate JSON file with seed and scores data."""
     json_data = {
         "category": "socialrank",
-        "channel": ecosystem_name,
+        "channel": channel_id,
         "seed": seed_data,
         "scores": scores_data,
     }
 
-    # Write JSON file with pretty formatting
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(json_data, f, indent=2, ensure_ascii=False)
 
-    print(f"✓ Created {output_file}")
-    print(f"  Seed entries: {len(seed_data)}")
-    print(f"  Score entries: {len(scores_data)}")
+    print(f"  ✅ Created {output_file}")
+    print(f"     Seed entries: {len(seed_data)}")
+    print(f"     Score entries: {len(scores_data)}")
 
 
 def main():
-    """
-    Main execution function.
-    """
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(
-        description="Generate JSON files for UI from seed and output data"
-    )
-    parser.add_argument(
-        "--with-user-ids",
-        action="store_true",
-        help="Keep user IDs instead of converting to display names",
-    )
-    args = parser.parse_args()
-
+    """Main execution function."""
     print("=" * 60)
     print("Generating JSON files for UI")
     print("=" * 60)
-    if args.with_user_ids:
-        print("Mode: Keep user IDs (no display name conversion)")
-    else:
-        print('Mode: Convert to display names (username > "first last" > user_id)')
     print()
 
     # Define directories
@@ -327,32 +318,28 @@ def main():
     # Process each seed file
     for seed_file in seed_files:
         base_name = seed_file.stem
-        channel_id = get_channel_id(base_name)
+        channel_id = base_name
 
         print(f"Processing: {base_name}")
 
-        # Load seed data (all entries)
+        # Load user info
+        user_info = load_user_info(channel_id)
+
+        # Calculate user stats from messages
+        user_stats = calculate_user_stats(channel_id)
+
+        # Load seed data
         seed_data = load_seed_data(seed_file)
         print(f"  ✅ Loaded {len(seed_data)} seed entries")
 
-        # Find corresponding scores file (same name, in output/ directory)
+        # Load scores
         scores_file = output_dir / f"{base_name}.csv"
         scores_data = load_scores(scores_file)
+        print(f"  ✅ Loaded {len(scores_data)} score entries")
 
-        # Convert user IDs to display names unless --with-user-ids flag is set
-        if not args.with_user_ids:
-            # Load user ID to display name mapping
-            user_id_mapping = load_user_ids_mapping(channel_id)
-
-            # Convert seed user IDs to display names
-            seed_data = convert_ids_to_display_names(seed_data, user_id_mapping)
-            print(f"  ✅ Converted seed IDs to display names")
-
-            # Convert scores user IDs to display names
-            scores_data = convert_ids_to_display_names(scores_data, user_id_mapping)
-            print(f"  ✅ Converted scores IDs to display names")
-        else:
-            print(f"  📋 Keeping user IDs (no display name conversion)")
+        # Enrich data with user info and stats
+        seed_data = enrich_data(seed_data, user_info, user_stats)
+        scores_data = enrich_data(scores_data, user_info, user_stats)
 
         # Generate JSON file
         output_file = ui_dir / f"{base_name}.json"

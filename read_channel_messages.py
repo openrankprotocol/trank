@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Generator, List, TypeVar, Union
 
 from telethon.tl.functions.messages import GetRepliesRequest
+from telethon.tl.functions.users import GetFullUserRequest
 
 
 class DateTimeEncoder(json.JSONEncoder):
@@ -162,13 +163,40 @@ async def fetch_replies_for_post(
                 # Collect user info from reply sender
                 if msg.from_id and hasattr(msg.from_id, "user_id"):
                     reply_user_id = msg.from_id.user_id
+
                     if reply_user_id not in user_info:
                         try:
                             user = await client.get_entity(reply_user_id)
+
+                            # Get profile photo URL if available
+                            photo_url = ""
+                            if user.photo:
+                                try:
+                                    photo_url = (
+                                        f"photo:{user.photo.photo_id}"
+                                        if hasattr(user.photo, "photo_id")
+                                        else ""
+                                    )
+                                except Exception:
+                                    pass
+
+                            # Get bio/description
+                            bio = ""
+                            try:
+                                full_user = await client(
+                                    GetFullUserRequest(reply_user_id)
+                                )
+                                if full_user.full_user.about:
+                                    bio = full_user.full_user.about
+                            except Exception:
+                                pass
+
                             user_info[reply_user_id] = {
                                 "username": user.username or "",
                                 "first_name": user.first_name or "",
                                 "last_name": user.last_name or "",
+                                "photo_url": photo_url,
+                                "bio": bio,
                             }
                         except Exception:
                             pass
@@ -529,7 +557,7 @@ async def fetch_channel_messages(client: TelegramClient, channel: int, config: d
             clear_checkpoint(channel)
     else:
         messages_with_reactions = []
-        user_info = {}  # Track user_id -> {username, first_name, last_name}
+        user_info = {}  # Track user_id -> {username, first_name, last_name, photo_url, bio}
         offset_id = 0
         total_fetched = 0
 
@@ -605,13 +633,38 @@ async def fetch_channel_messages(client: TelegramClient, channel: int, config: d
                 # Collect user info from message sender
                 if message.from_id and hasattr(message.from_id, "user_id"):
                     user_id = message.from_id.user_id
+
                     if user_id not in user_info:
                         try:
                             user = await client.get_entity(user_id)
+
+                            # Get profile photo URL if available
+                            photo_url = ""
+                            if user.photo:
+                                try:
+                                    photo_url = (
+                                        f"photo:{user.photo.photo_id}"
+                                        if hasattr(user.photo, "photo_id")
+                                        else ""
+                                    )
+                                except Exception:
+                                    pass
+
+                            # Get bio/description
+                            bio = ""
+                            try:
+                                full_user = await client(GetFullUserRequest(user_id))
+                                if full_user.full_user.about:
+                                    bio = full_user.full_user.about
+                            except Exception:
+                                pass
+
                             user_info[user_id] = {
                                 "username": user.username or "",
                                 "first_name": user.first_name or "",
                                 "last_name": user.last_name or "",
+                                "photo_url": photo_url,
+                                "bio": bio,
                             }
                         except Exception:
                             # If we can't get user info, just skip it
@@ -684,10 +737,38 @@ async def fetch_channel_messages(client: TelegramClient, channel: int, config: d
                                         if user_id not in user_info:
                                             try:
                                                 user = await client.get_entity(user_id)
+
+                                                # Get profile photo URL if available
+                                                photo_url = ""
+                                                if user.photo:
+                                                    try:
+                                                        photo_url = (
+                                                            f"photo:{user.photo.photo_id}"
+                                                            if hasattr(
+                                                                user.photo, "photo_id"
+                                                            )
+                                                            else ""
+                                                        )
+                                                    except Exception:
+                                                        pass
+
+                                                # Get bio/description
+                                                bio = ""
+                                                try:
+                                                    full_user = await client(
+                                                        GetFullUserRequest(user_id)
+                                                    )
+                                                    if full_user.full_user.about:
+                                                        bio = full_user.full_user.about
+                                                except Exception:
+                                                    pass
+
                                                 user_info[user_id] = {
                                                     "username": user.username or "",
                                                     "first_name": user.first_name or "",
                                                     "last_name": user.last_name or "",
+                                                    "photo_url": photo_url,
+                                                    "bio": bio,
                                                 }
                                             except Exception:
                                                 pass
@@ -789,12 +870,16 @@ async def save_messages(results: list, config: dict):
         if user_info:
             csv_filename = output_dir / f"{result['channel']}_user_ids.csv"
             with open(csv_filename, "w", encoding="utf-8") as f:
-                f.write("user_id,username,first_name,last_name\n")
+                f.write("user_id,username,first_name,last_name,photo_url,bio\n")
                 for user_id, info in sorted(user_info.items()):
                     username = info.get("username", "")
                     first_name = info.get("first_name", "").replace(",", " ")
                     last_name = info.get("last_name", "").replace(",", " ")
-                    f.write(f"{user_id},{username},{first_name},{last_name}\n")
+                    photo_url = info.get("photo_url", "")
+                    bio = info.get("bio", "").replace(",", " ").replace("\n", " ")
+                    f.write(
+                        f"{user_id},{username},{first_name},{last_name},{photo_url},{bio}\n"
+                    )
             print(f"👥 Saved {len(user_info)} users to {csv_filename}")
 
         # Messages are already in simplified format from fetch_channel_messages
