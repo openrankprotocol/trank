@@ -34,7 +34,7 @@ max_reply_depth = 4
 # Use 'python list_channels.py' to see all your channels and their IDs
 include = [
     2244967395, # Base LatAm
-    # 2468695644
+    # 2468695644, # Ritual-Korea
 ]
 
 # List of channel IDs to exclude from crawling

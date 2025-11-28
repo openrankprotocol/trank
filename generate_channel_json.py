@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-Generate JSON files for UI from seed and output data.
+Generate JSON files for UI from seed and output data for Telegram Channels.
+
+This script is specifically designed for channel data where:
+- Main posts have from_id: null (channel announcements)
+- Replies are nested within replies_data
+- Reactions have user_id: null with only count (aggregated) - so num_given_reactions is not tracked
 
 This script:
 1. Loads channel list from config.toml
@@ -11,7 +16,7 @@ This script:
 6. Creates JSON files for each channel with enriched user data
 
 Usage:
-    python3 generate_json.py
+    python3 generate_channel_json.py
 
 Requirements:
     - pandas (install with: pip install pandas)
@@ -103,18 +108,18 @@ def load_user_info(channel_id):
     return user_info
 
 
-def calculate_user_stats(channel_id):
+def calculate_channel_user_stats(channel_id):
     """
-    Calculate user stats from messages JSON file.
+    Calculate user stats from channel messages JSON file.
+
+    For channels, reactions are aggregated (user_id is null, only count is available),
+    so we cannot track num_given_reactions.
 
     Stats calculated per user:
     - num_posts: Number of messages/replies posted
     - num_received_reactions: Total reactions received on their messages
     - num_received_replies: Total replies under all messages authored by this user
-    - num_given_reactions: Number of reactions they gave
     - num_given_replies: Number of replies they made
-    - first_post_at: Date-time of first post
-    - last_post_at: Date-time of last post
 
     Args:
         channel_id: Channel ID to calculate stats for
@@ -127,7 +132,6 @@ def calculate_user_stats(channel_id):
             "num_posts": 0,
             "num_received_reactions": 0,
             "num_received_replies": 0,
-            "num_given_reactions": 0,
             "num_given_replies": 0,
             "first_post_at": None,
             "last_post_at": None,
@@ -150,33 +154,33 @@ def calculate_user_stats(channel_id):
         message_authors = {}
         all_messages = []
 
-        def collect_messages(msg):
+        def collect_messages(msg, is_reply=False):
             """Collect all messages and build author map."""
             msg_id = msg.get("id")
             author_id = msg.get("from_id")
             if msg_id and author_id:
                 message_authors[msg_id] = str(author_id)
-            all_messages.append(msg)
+            all_messages.append((msg, is_reply))
             for reply in msg.get("replies_data", []):
-                collect_messages(reply)
+                collect_messages(reply, is_reply=True)
 
         for msg in messages:
-            collect_messages(msg)
+            collect_messages(msg, is_reply=False)
 
         # Second pass: calculate stats
-        for msg in all_messages:
+        for msg, is_reply in all_messages:
             author_id = msg.get("from_id")
-            is_reply = msg.get("reply_to_msg_id") is not None or any(
-                msg.get("id") in [r.get("id") for r in m.get("replies_data", [])]
-                for m in messages
-            )
 
             if author_id:
                 author_id = str(author_id)
                 # Count post
                 stats[author_id]["num_posts"] += 1
 
-                # Track first and last post dates
+                # If this message is a reply (has reply_to_msg_id or is in replies_data), increment given_replies
+                if msg.get("reply_to_msg_id") is not None or is_reply:
+                    stats[author_id]["num_given_replies"] += 1
+
+                # Track first and last post timestamps
                 msg_date = msg.get("date")
                 if msg_date:
                     current_first = stats[author_id]["first_post_at"]
@@ -186,18 +190,11 @@ def calculate_user_stats(channel_id):
                     if current_last is None or msg_date > current_last:
                         stats[author_id]["last_post_at"] = msg_date
 
-                # If this message is a reply (has reply_to_msg_id), increment given_replies
-                if msg.get("reply_to_msg_id") is not None:
-                    stats[author_id]["num_given_replies"] += 1
-
             # Process reactions on this message
+            # For channels, reactions are aggregated (user_id is null)
+            # We can only count received reactions, not given reactions
             reactions = msg.get("reactions", [])
             for reaction in reactions:
-                reactor_id = reaction.get("user_id")
-                if reactor_id:
-                    reactor_id = str(reactor_id)
-                    stats[reactor_id]["num_given_reactions"] += 1
-
                 # Count received reactions for message author
                 if author_id:
                     # Handle reactions with count field (aggregated)
@@ -281,7 +278,6 @@ def enrich_data(data, user_info, user_stats):
             "num_posts": stats.get("num_posts", 0),
             "num_received_reactions": stats.get("num_received_reactions", 0),
             "num_received_replies": stats.get("num_received_replies", 0),
-            "num_given_reactions": stats.get("num_given_reactions", 0),
             "num_given_replies": stats.get("num_given_replies", 0),
             "first_post_at": stats.get("first_post_at"),
             "last_post_at": stats.get("last_post_at"),
@@ -335,8 +331,11 @@ def get_channels_from_config(config):
 def main():
     """Main execution function."""
     print("=" * 60)
-    print("Generating JSON files for UI")
+    print("Generating JSON files for UI (Channel Mode)")
     print("=" * 60)
+    print()
+    print("Note: num_given_reactions is not available for channels")
+    print("      (Telegram only provides aggregated reaction counts)")
     print()
 
     # Load config
@@ -377,8 +376,8 @@ def main():
         # Load user info
         user_info = load_user_info(channel_id)
 
-        # Calculate user stats from messages
-        user_stats = calculate_user_stats(channel_id)
+        # Calculate user stats from messages (channel-specific)
+        user_stats = calculate_channel_user_stats(channel_id)
 
         # Load seed data
         seed_data = load_seed_data(seed_file)
