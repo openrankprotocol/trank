@@ -110,10 +110,10 @@ def clear_checkpoint(channel: int):
 async def fetch_channel_messages(client: TelegramClient, channel: int, config: dict):
     """Fetch messages from a Telegram channel within the configured time window."""
     crawler_config = config.get("crawler", {})
-    channels_config = config.get("channels", {})
+    group_chats_config = config.get("group_chats", {})
 
     # Check if channel is excluded
-    excluded_channels = channels_config.get("exclude", [])
+    excluded_channels = group_chats_config.get("exclude", [])
     if channel in excluded_channels:
         print(f"⏭️  Skipping excluded channel: {channel}")
         return {"channel": channel, "messages": [], "skipped": True}
@@ -476,7 +476,7 @@ async def main():
     # Load configuration
     config = load_config()
     crawler_config = config.get("crawler", {})
-    channels_config = config.get("channels", {})
+    group_chats_config = config.get("group_chats", {})
 
     # Get environment variables
     api_id = int(os.getenv("TELEGRAM_APP_ID", "0"))
@@ -489,10 +489,10 @@ async def main():
         print("\nGet your credentials from: https://my.telegram.org")
         sys.exit(1)
 
-    # Get channels to crawl (must be integers)
-    channels = channels_config.get("include", [])
+    # Get group chats to crawl (must be integers)
+    channels = group_chats_config.get("include", [])
     if not channels:
-        print("❌ Error: No channels configured in config.toml")
+        print("❌ Error: No group chats configured in config.toml")
         sys.exit(1)
 
     # Validate that all channels are integers

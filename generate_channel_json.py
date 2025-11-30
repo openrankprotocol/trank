@@ -108,6 +108,75 @@ def load_user_info(channel_id):
     return user_info
 
 
+def load_admins(channel_id):
+    """
+    Load admin user IDs from CSV file.
+
+    Args:
+        channel_id: Channel ID to load admins for
+
+    Returns:
+        set: Set of admin user IDs (as strings)
+    """
+    admins = set()
+
+    try:
+        admins_file = Path(f"raw/{channel_id}_admins.csv")
+
+        if admins_file.exists():
+            print(f"  👑 Loading admins from: {admins_file}")
+            admins_df = pd.read_csv(admins_file)
+
+            for _, row in admins_df.iterrows():
+                user_id = str(row["user_id"])
+                admins.add(user_id)
+
+            print(f"  ✅ Loaded {len(admins)} admins")
+        else:
+            print(f"  ⚠️  Warning: {admins_file} not found, no admin info")
+
+    except Exception as e:
+        print(f"  ⚠️  Warning: Could not load admins: {str(e)}")
+
+    return admins
+
+
+def count_total_posts(channel_id):
+    """
+    Count total number of posts (messages and replies) in the channel.
+
+    Args:
+        channel_id: Channel ID to count posts for
+
+    Returns:
+        int: Total number of posts
+    """
+    messages_file = Path(f"raw/{channel_id}_messages.json")
+
+    if not messages_file.exists():
+        return 0
+
+    try:
+        with open(messages_file, "r", encoding="utf-8") as f:
+            messages = json.load(f)
+
+        total = 0
+
+        def count_messages(msg):
+            nonlocal total
+            total += 1
+            for reply in msg.get("replies_data", []):
+                count_messages(reply)
+
+        for msg in messages:
+            count_messages(msg)
+
+        return total
+
+    except Exception:
+        return 0
+
+
 def calculate_channel_user_stats(channel_id):
     """
     Calculate user stats from channel messages JSON file.
@@ -125,7 +194,10 @@ def calculate_channel_user_stats(channel_id):
         channel_id: Channel ID to calculate stats for
 
     Returns:
-        dict: Mapping of user_id (str) -> stats dict
+        tuple: (stats dict, first_message_at, last_message_at)
+            - stats: Mapping of user_id (str) -> stats dict
+            - first_message_at: Timestamp of earliest message
+            - last_message_at: Timestamp of most recent message
     """
     stats = defaultdict(
         lambda: {
@@ -142,7 +214,7 @@ def calculate_channel_user_stats(channel_id):
 
     if not messages_file.exists():
         print(f"  ⚠️  Warning: {messages_file} not found, stats will be empty")
-        return dict(stats)
+        return dict(stats), None, None
 
     try:
         print(f"  📊 Calculating stats from: {messages_file}")
@@ -167,9 +239,27 @@ def calculate_channel_user_stats(channel_id):
         for msg in messages:
             collect_messages(msg, is_reply=False)
 
+        # Track channel-wide first/last message timestamps
+        channel_first_message_at = None
+        channel_last_message_at = None
+
         # Second pass: calculate stats
         for msg, is_reply in all_messages:
             author_id = msg.get("from_id")
+
+            # Track channel-wide first/last message (regardless of author)
+            msg_date = msg.get("date")
+            if msg_date:
+                if (
+                    channel_first_message_at is None
+                    or msg_date < channel_first_message_at
+                ):
+                    channel_first_message_at = msg_date
+                if (
+                    channel_last_message_at is None
+                    or msg_date > channel_last_message_at
+                ):
+                    channel_last_message_at = msg_date
 
             if author_id:
                 author_id = str(author_id)
@@ -181,7 +271,6 @@ def calculate_channel_user_stats(channel_id):
                     stats[author_id]["num_given_replies"] += 1
 
                 # Track first and last post timestamps
-                msg_date = msg.get("date")
                 if msg_date:
                     current_first = stats[author_id]["first_post_at"]
                     current_last = stats[author_id]["last_post_at"]
@@ -230,8 +319,9 @@ def calculate_channel_user_stats(channel_id):
         import traceback
 
         traceback.print_exc()
+        return dict(stats), None, None
 
-    return dict(stats)
+    return dict(stats), channel_first_message_at, channel_last_message_at
 
 
 def load_seed_data(seed_file):
@@ -250,7 +340,36 @@ def load_scores(scores_file):
     return df.to_dict("records")
 
 
-def enrich_data(data, user_info, user_stats):
+def calculate_channel_engagement_score(total_num_posts, total_reactions, total_replies):
+    """
+    Calculate channel-wide engagement score between 0.0 and 1.0.
+
+    The score is based on the ratio of engagement (reactions + replies) to posts.
+    A score of 1.0 means very high engagement relative to posts.
+
+    Formula: min(1.0, (total_reactions + total_replies * 2) / (total_num_posts * 5))
+
+    The divisor of 5 is a normalization factor - we consider 5 engagements per post
+    as "maximum" engagement.
+
+    Args:
+        total_num_posts: Total number of posts in the channel
+        total_reactions: Total number of reactions across all posts
+        total_replies: Total number of replies across all posts
+
+    Returns:
+        float: Engagement score between 0.0 and 1.0
+    """
+    if total_num_posts == 0:
+        return 0.0
+
+    engagement = total_reactions + (total_replies * 2)
+    max_expected_engagement = total_num_posts * 5
+    score = engagement / max_expected_engagement
+    return min(1.0, round(score, 4))
+
+
+def enrich_data(data, user_info, user_stats, admins):
     """
     Enrich data entries with user info and stats.
 
@@ -258,6 +377,7 @@ def enrich_data(data, user_info, user_stats):
         data: List of dicts with 'i' (user_id) and 'v' (value)
         user_info: Dict mapping user_id -> {username, display_name, bio}
         user_stats: Dict mapping user_id -> stats
+        admins: Set of admin user IDs
 
     Returns:
         List of enriched entries
@@ -275,6 +395,7 @@ def enrich_data(data, user_info, user_stats):
             "username": info.get("username", ""),
             "display_name": info.get("display_name", user_id),
             "bio": info.get("bio", ""),
+            "is_admin": user_id in admins,
             "num_posts": stats.get("num_posts", 0),
             "num_received_reactions": stats.get("num_received_reactions", 0),
             "num_received_replies": stats.get("num_received_replies", 0),
@@ -288,13 +409,30 @@ def enrich_data(data, user_info, user_stats):
     return enriched
 
 
-def generate_json_file(channel_id, seed_data, scores_data, output_file):
+def generate_json_file(
+    channel_id,
+    seed_data,
+    scores_data,
+    output_file,
+    days_back,
+    total_num_posts,
+    total_users,
+    first_message_at,
+    last_message_at,
+    engagement_score,
+):
     """Generate JSON file with seed and scores data."""
     created_at = datetime.now(timezone.utc).isoformat()
     json_data = {
         "category": "socialrank",
         "channel": channel_id,
         "created_at": created_at,
+        "days_back": days_back,
+        "total_num_posts": total_num_posts,
+        "total_users": total_users,
+        "first_message_at": first_message_at,
+        "last_message_at": last_message_at,
+        "engagement_score": engagement_score,
         "seed": seed_data,
         "scores": scores_data,
     }
@@ -376,8 +514,13 @@ def main():
         # Load user info
         user_info = load_user_info(channel_id)
 
+        # Load admins
+        admins = load_admins(channel_id)
+
         # Calculate user stats from messages (channel-specific)
-        user_stats = calculate_channel_user_stats(channel_id)
+        user_stats, first_message_at, last_message_at = calculate_channel_user_stats(
+            channel_id
+        )
 
         # Load seed data
         seed_data = load_seed_data(seed_file)
@@ -389,12 +532,39 @@ def main():
         print(f"  ✅ Loaded {len(scores_data)} score entries")
 
         # Enrich data with user info and stats
-        seed_data = enrich_data(seed_data, user_info, user_stats)
-        scores_data = enrich_data(scores_data, user_info, user_stats)
+        seed_data = enrich_data(seed_data, user_info, user_stats, admins)
+        scores_data = enrich_data(scores_data, user_info, user_stats, admins)
+
+        # Calculate totals
+        days_back = config.get("crawler", {}).get("time_window_days", 0)
+        total_num_posts = count_total_posts(channel_id)
+        total_users = len(user_stats)
+
+        # Calculate total reactions and replies for engagement score
+        total_reactions = sum(
+            s.get("num_received_reactions", 0) for s in user_stats.values()
+        )
+        total_replies = sum(
+            s.get("num_received_replies", 0) for s in user_stats.values()
+        )
+        engagement_score = calculate_channel_engagement_score(
+            total_num_posts, total_reactions, total_replies
+        )
 
         # Generate JSON file
         output_file = ui_dir / f"{channel_id}.json"
-        generate_json_file(channel_id, seed_data, scores_data, output_file)
+        generate_json_file(
+            channel_id,
+            seed_data,
+            scores_data,
+            output_file,
+            days_back,
+            total_num_posts,
+            total_users,
+            first_message_at,
+            last_message_at,
+            engagement_score,
+        )
         print()
 
     print("=" * 60)

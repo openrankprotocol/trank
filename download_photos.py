@@ -151,11 +151,12 @@ async def main():
         print(f"❌ Error: {e}")
         sys.exit(1)
 
-    channels_config = config.get("channels", {})
-    channels = channels_config.get("include", [])
+    group_chats = config.get("group_chats", {}).get("include", [])
+    channels = config.get("channels", {}).get("include", [])
+    all_channels = group_chats + channels
 
-    if not channels:
-        print("❌ Error: No channels configured in config.toml")
+    if not all_channels:
+        print("❌ Error: No group_chats or channels configured in config.toml")
         sys.exit(1)
 
     # Get environment variables
@@ -192,7 +193,7 @@ async def main():
     total_skipped = 0
     total_failed = 0
 
-    for channel_id in channels:
+    for channel_id in all_channels:
         print(f"{'=' * 60}")
         print(f"Channel: {channel_id}")
         print(f"{'=' * 60}")

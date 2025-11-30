@@ -28,22 +28,21 @@ fetch_replies = true
 # Higher values fetch more nested conversations but take longer
 max_reply_depth = 4
 
+[group_chats]
+# List of group chat to crawl (must be numeric IDs, not usernames)
+# Use 'python list_channels.py' to see all your channels and their IDs
+include = [
+    2244967395, # Base LatAm
+    1242127973,
+    1533865579,
+]
 
 [channels]
 # List of channel IDs to crawl (must be numeric IDs, not usernames)
 # Use 'python list_channels.py' to see all your channels and their IDs
 include = [
-    2244967395, # Base LatAm
-    # 2468695644, # Ritual-Korea
+    2468695644, # Ritual-Korea - Channel
 ]
-
-# List of channel IDs to exclude from crawling
-# Useful for filtering out logs, bots, operational channels, etc.
-exclude = [
-    # -1001111111111,
-    # -1002222222222,
-]
-
 
 [output]
 # Pretty print JSON output (uses indentation)

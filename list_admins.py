@@ -306,6 +306,7 @@ async def main():
 
     # Load configuration
     config = load_config()
+    group_chats_config = config.get("group_chats", {})
     channels_config = config.get("channels", {})
 
     # Get environment variables
@@ -318,11 +319,13 @@ async def main():
         print("Please set TELEGRAM_APP_ID and TELEGRAM_APP_HASH")
         sys.exit(1)
 
-    # Get channels to check (must be integers)
-    channels = channels_config.get("include", [])
+    # Get channels to check (must be integers) - combine group_chats and channels
+    group_chats = group_chats_config.get("include", [])
+    channels_list = channels_config.get("include", [])
+    channels = group_chats + channels_list
     if not channels:
-        print("❌ Error: No channels configured in config.toml")
-        print("Add channel IDs to [channels] include = [...]")
+        print("❌ Error: No group chats or channels configured in config.toml")
+        print("Add IDs to [group_chats] include = [...] or [channels] include = [...]")
         sys.exit(1)
 
     # Validate that all channels are integers

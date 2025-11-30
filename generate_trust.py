@@ -225,7 +225,7 @@ def main():
 
     # Load configuration
     config = load_config()
-    channels_config = config.get("channels", {})
+    channels_config = config.get("group_chats", {})
     trust_config = config.get("trust", {})
 
     if not trust_config:
