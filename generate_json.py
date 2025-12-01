@@ -97,6 +97,52 @@ def load_user_info(channel_id):
         else:
             print(f"  ⚠️  Warning: {mapping_file} not found")
 
+        # Also load from admins file (for users who are admins but haven't posted)
+        admins_file = Path(f"raw/{channel_id}_admins.csv")
+        if admins_file.exists():
+            admins_df = pd.read_csv(admins_file)
+            added_from_admins = 0
+
+            for _, row in admins_df.iterrows():
+                user_id = str(row["user_id"])
+
+                # Skip if we already have info for this user
+                if user_id in user_info:
+                    continue
+
+                # Extract username
+                username = ""
+                if pd.notna(row.get("username")):
+                    username = str(row["username"]).strip()
+
+                # Extract first name
+                first_name = ""
+                if pd.notna(row.get("first_name")):
+                    first_name = str(row["first_name"]).strip()
+
+                # Extract last name
+                last_name = ""
+                if pd.notna(row.get("last_name")):
+                    last_name = str(row["last_name"]).strip()
+
+                # Build display name: "first last" or username or user_id
+                if first_name or last_name:
+                    display_name = f"{first_name} {last_name}".strip()
+                elif username:
+                    display_name = username
+                else:
+                    display_name = user_id
+
+                user_info[user_id] = {
+                    "username": username,
+                    "display_name": display_name,
+                    "bio": "",  # Admins file doesn't have bio
+                }
+                added_from_admins += 1
+
+            if added_from_admins > 0:
+                print(f"  ✅ Added {added_from_admins} users from admins file")
+
     except Exception as e:
         print(f"  ⚠️  Warning: Could not load user info: {str(e)}")
 
