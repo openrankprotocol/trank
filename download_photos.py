@@ -98,33 +98,47 @@ async def download_photos_for_channel(
             continue
 
         try:
-            # Download profile photo (small size)
-            result = await client.download_profile_photo(
-                user_id,
-                file=str(photo_path),
-                download_big=False,  # Download the small-size photo
+            # Download profile photo (small size) with timeout
+            result = await asyncio.wait_for(
+                client.download_profile_photo(
+                    user_id,
+                    file=str(photo_path),
+                    download_big=False,  # Download the small-size photo
+                ),
+                timeout=10.0,  # 10 second timeout per photo
             )
 
             if result:
                 downloaded += 1
-                if i % 10 == 0 or i == len(user_ids):
-                    print(
-                        f"   📸 Progress: {i}/{len(user_ids)} - Downloaded {downloaded}, Skipped {skipped}, Failed {failed}"
-                    )
             else:
                 # User has no profile photo
                 skipped += 1
+
+        except asyncio.TimeoutError:
+            failed += 1
+            print(f"   ⚠️  Timeout downloading photo for user {user_id}")
 
         except Exception as e:
             failed += 1
             if "user" in str(e).lower() and "invalid" in str(e).lower():
                 # User doesn't exist or is inaccessible
-                pass
+                skipped += 1
+                failed -= 1  # Don't count as failed, just skipped
+            elif "flood" in str(e).lower() or "wait" in str(e).lower():
+                # Rate limited - wait longer
+                print(f"   ⚠️  Rate limited, waiting 30 seconds...")
+                await asyncio.sleep(30)
             else:
                 print(f"   ⚠️  Error downloading photo for user {user_id}: {e}")
 
-        # Small delay to avoid rate limiting
-        await asyncio.sleep(0.1)
+        # Print progress every 10 users
+        if i % 10 == 0 or i == len(user_ids):
+            print(
+                f"   📸 Progress: {i}/{len(user_ids)} - Downloaded {downloaded}, Skipped {skipped}, Failed {failed}"
+            )
+
+        # Delay to avoid rate limiting (increased from 0.1 to 0.5)
+        await asyncio.sleep(0.5)
 
     return downloaded, skipped, failed
 
