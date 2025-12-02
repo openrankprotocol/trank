@@ -2,23 +2,54 @@
 """
 List Telegram Channels
 Shows all channels/chats the logged-in user has access to.
+Saves channel metadata to raw/channels.json (only for channels in config.toml)
 """
 
 import asyncio
+import json
 import os
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.tl.types import Channel, Chat, User
 
+# Use built-in tomllib for Python 3.11+, fallback to tomli for older versions
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        import toml as tomllib
+
 # Load environment variables
 load_dotenv()
+
+
+def load_config():
+    """Load configuration from config.toml"""
+    config_path = Path(__file__).parent / "config.toml"
+
+    if not config_path.exists():
+        return None
+
+    with open(config_path, "rb") as f:
+        return tomllib.load(f)
 
 
 async def main():
     """List all channels/chats the user has access to."""
     print("📋 Listing Your Telegram Channels\n")
+
+    # Load config to filter which channels to save
+    config = load_config()
+    config_channel_ids = set()
+    config_group_ids = set()
+    if config:
+        config_group_ids = set(config.get("group_chats", {}).get("include", []))
+        config_channel_ids = set(config.get("channels", {}).get("include", []))
 
     # Get environment variables
     api_id = int(os.getenv("TELEGRAM_APP_ID", "0"))
@@ -168,6 +199,41 @@ async def main():
             print(f"    # ... and {len(channels) - 5} more channels")
 
         print("]")
+        print()
+
+        # Save channels and groups to raw/channels.json (only those in config.toml)
+        raw_dir = Path("raw")
+        raw_dir.mkdir(exist_ok=True)
+
+        channels_data = []
+        for ch in channels:
+            if ch["id"] in config_channel_ids:
+                channels_data.append(
+                    {
+                        "channel_id": ch["id"],
+                        "name": ch["title"],
+                        "username": ch["username"],
+                        "is_group": False,
+                    }
+                )
+        for grp in groups:
+            if grp["id"] in config_group_ids:
+                channels_data.append(
+                    {
+                        "channel_id": grp["id"],
+                        "name": grp["title"],
+                        "username": grp["username"],
+                        "is_group": True,
+                    }
+                )
+
+        channels_file = raw_dir / "channels.json"
+        with open(channels_file, "w", encoding="utf-8") as f:
+            json.dump(channels_data, f, indent=2, ensure_ascii=False)
+
+        print(
+            f"💾 Saved {len(channels_data)} channels/groups from config.toml to {channels_file}"
+        )
         print()
 
         print("✅ Done!\n")

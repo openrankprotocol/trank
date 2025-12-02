@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Import Messages and Reactions to PostgreSQL
+Import Messages, Reactions, Users, and Channels to PostgreSQL
 
 Imports messages from raw/[channel_id]_messages.json files into PostgreSQL database.
-Also imports reactions from those messages.
+Also imports reactions from those messages, users from CSV files, and channel metadata from raw/channels.json.
 
 Usage:
     python3 import_to_db.py                    # Import all channels from config
@@ -15,29 +15,11 @@ Requirements:
     - Environment variable: DATABASE_URL (e.g., postgresql://user:pass@localhost:5432/dbname)
 
 Database schema:
-    CREATE TABLE messages (
-        id BIGINT NOT NULL,
-        channel_id BIGINT NOT NULL,
-        date TIMESTAMP WITH TIME ZONE NOT NULL,
-        from_id BIGINT NOT NULL,
-        message TEXT,
-        reply_to_msg_id BIGINT,
-        PRIMARY KEY (channel_id, id)
-    );
-
-    CREATE TABLE message_reactions (
-        id SERIAL PRIMARY KEY,
-        channel_id BIGINT NOT NULL,
-        message_id BIGINT NOT NULL,
-        user_id BIGINT NOT NULL,
-        emoji VARCHAR(32) NOT NULL,
-        date TIMESTAMP WITH TIME ZONE NOT NULL,
-        FOREIGN KEY (channel_id, message_id) REFERENCES messages(channel_id, id) ON DELETE CASCADE,
-        UNIQUE (channel_id, message_id, user_id, emoji)
-    );
+    See schemas/messages.sql, schemas/reactions.sql, schemas/users.sql, and schemas/channels.sql
 """
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -106,37 +88,35 @@ def collect_messages_and_reactions(messages, channel_id):
         if msg_id is None or date is None:
             return
 
-        # Skip messages without from_id (channel announcements)
-        if from_id is None:
-            return
-
-        # Add message tuple: (id, channel_id, date, from_id, message, reply_to_msg_id)
-        all_messages.append(
-            (msg_id, channel_id, date, from_id, message_text, reply_to_msg_id)
-        )
-
-        # Process reactions
-        reactions = msg.get("reactions", [])
-        for reaction in reactions:
-            user_id = reaction.get("user_id")
-            emoji = reaction.get("emoji")
-
-            # Skip aggregated reactions (user_id is null for channels)
-            if user_id is None:
-                continue
-
-            # Add reaction tuple: (channel_id, message_id, user_id, emoji, date)
-            all_reactions.append(
-                (
-                    channel_id,
-                    msg_id,
-                    user_id,
-                    emoji,
-                    date,  # Use message date as reaction date (Telegram doesn't provide reaction timestamp)
-                )
+        # Only add messages that have from_id (skip channel announcements)
+        if from_id is not None:
+            # Add message tuple: (id, channel_id, date, from_id, message, reply_to_msg_id)
+            all_messages.append(
+                (msg_id, channel_id, date, from_id, message_text, reply_to_msg_id)
             )
 
-        # Process nested replies
+            # Process reactions
+            reactions = msg.get("reactions", [])
+            for reaction in reactions:
+                user_id = reaction.get("user_id")
+                emoji = reaction.get("emoji")
+
+                # Skip aggregated reactions (user_id is null for channels)
+                if user_id is None:
+                    continue
+
+                # Add reaction tuple: (channel_id, message_id, user_id, emoji, date)
+                all_reactions.append(
+                    (
+                        channel_id,
+                        msg_id,
+                        user_id,
+                        emoji,
+                        date,  # Use message date as reaction date (Telegram doesn't provide reaction timestamp)
+                    )
+                )
+
+        # Always process nested replies (even if parent has no from_id, like channel posts)
         replies_data = msg.get("replies_data", [])
         for reply in replies_data:
             process_message(reply)
@@ -148,9 +128,166 @@ def collect_messages_and_reactions(messages, channel_id):
     return all_messages, all_reactions
 
 
+def collect_users_from_csv(channel_id):
+    """
+    Collect users and admins from CSV files.
+
+    Args:
+        channel_id: Channel ID
+
+    Returns:
+        list of user tuples: (channel_id, user_id, username, first_name, last_name, bio, photo_id, is_admin)
+    """
+    users_file = Path("raw") / f"{channel_id}_user_ids.csv"
+    admins_file = Path("raw") / f"{channel_id}_admins.csv"
+
+    users_dict = {}  # user_id -> user data
+    admin_ids = set()
+
+    # Load admins first
+    if admins_file.exists():
+        with open(admins_file, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                user_id = row.get("user_id")
+                if user_id:
+                    admin_ids.add(int(user_id))
+
+    # Load users
+    if users_file.exists():
+        with open(users_file, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                user_id = row.get("user_id")
+                if not user_id:
+                    continue
+
+                user_id = int(user_id)
+                username = row.get("username") or None
+                first_name = row.get("first_name") or None
+                last_name = row.get("last_name") or None
+                bio = row.get("bio") or None
+
+                # Parse photo_id from photo_url (format: "photo:123456")
+                photo_url = row.get("photo_url") or ""
+                photo_id = None
+                if photo_url.startswith("photo:"):
+                    try:
+                        photo_id = int(photo_url.split(":")[1])
+                    except (ValueError, IndexError):
+                        pass
+
+                is_admin = user_id in admin_ids
+
+                users_dict[user_id] = (
+                    int(channel_id),
+                    user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    bio,
+                    photo_id,
+                    is_admin,
+                )
+
+    # Add any admins that weren't in the users file
+    for admin_id in admin_ids:
+        if admin_id not in users_dict:
+            users_dict[admin_id] = (
+                int(channel_id),
+                admin_id,
+                None,  # username
+                None,  # first_name
+                None,  # last_name
+                None,  # bio
+                None,  # photo_id
+                True,  # is_admin
+            )
+
+    return list(users_dict.values())
+
+
+def load_channels_metadata():
+    """
+    Load channel metadata from raw/channels.json.
+
+    Returns:
+        dict: channel_id -> channel data
+    """
+    channels_file = Path("raw") / "channels.json"
+
+    if not channels_file.exists():
+        return {}
+
+    with open(channels_file, "r", encoding="utf-8") as f:
+        channels_list = json.load(f)
+
+    return {ch["channel_id"]: ch for ch in channels_list}
+
+
+def import_channels(conn, channel_ids, channels_metadata, dry_run=False):
+    """
+    Import channel metadata to database.
+
+    Args:
+        conn: Database connection
+        channel_ids: List of channel IDs to import
+        channels_metadata: Dict of channel_id -> channel data
+        dry_run: If True, don't actually insert data
+
+    Returns:
+        int: Number of channels imported
+    """
+    channels_to_import = []
+
+    for channel_id in channel_ids:
+        channel_id_int = int(channel_id)
+        if channel_id_int in channels_metadata:
+            ch = channels_metadata[channel_id_int]
+            channels_to_import.append(
+                (
+                    channel_id_int,
+                    ch.get("name"),
+                    ch.get("username"),
+                    ch.get("is_group", False),
+                )
+            )
+
+    if not channels_to_import:
+        return 0
+
+    if dry_run:
+        return len(channels_to_import)
+
+    cursor = conn.cursor()
+
+    try:
+        execute_values(
+            cursor,
+            """
+            INSERT INTO trank.channels (channel_id, name, username, is_group)
+            VALUES %s
+            ON CONFLICT (channel_id) DO UPDATE SET
+                name = EXCLUDED.name,
+                username = EXCLUDED.username,
+                is_group = EXCLUDED.is_group,
+                updated_at = NOW()
+            """,
+            channels_to_import,
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        cursor.close()
+
+    return len(channels_to_import)
+
+
 def import_channel(conn, channel_id, dry_run=False):
     """
-    Import messages and reactions for a single channel.
+    Import messages, reactions, and users for a single channel.
 
     Args:
         conn: Database connection
@@ -158,13 +295,13 @@ def import_channel(conn, channel_id, dry_run=False):
         dry_run: If True, don't actually insert data
 
     Returns:
-        tuple: (messages_count, reactions_count)
+        tuple: (messages_count, reactions_count, users_count)
     """
     messages_file = Path("raw") / f"{channel_id}_messages.json"
 
     if not messages_file.exists():
         print(f"  ⚠️  Messages file not found: {messages_file}")
-        return 0, 0
+        return 0, 0, 0
 
     print(f"  📂 Loading messages from: {messages_file}")
 
@@ -176,11 +313,16 @@ def import_channel(conn, channel_id, dry_run=False):
         messages, int(channel_id)
     )
 
-    print(f"  📊 Found {len(all_messages)} messages and {len(all_reactions)} reactions")
+    # Collect users from CSV files
+    all_users = collect_users_from_csv(channel_id)
+
+    print(
+        f"  📊 Found {len(all_messages)} messages, {len(all_reactions)} reactions, and {len(all_users)} users"
+    )
 
     if dry_run:
         print(f"  🔍 Dry run - no data inserted")
-        return len(all_messages), len(all_reactions)
+        return len(all_messages), len(all_reactions), len(all_users)
 
     cursor = conn.cursor()
 
@@ -191,7 +333,7 @@ def import_channel(conn, channel_id, dry_run=False):
             execute_values(
                 cursor,
                 """
-                INSERT INTO messages (id, channel_id, date, from_id, message, reply_to_msg_id)
+                INSERT INTO trank.messages (id, channel_id, date, from_id, message, reply_to_msg_id)
                 VALUES %s
                 ON CONFLICT (channel_id, id) DO UPDATE SET
                     date = EXCLUDED.date,
@@ -209,7 +351,7 @@ def import_channel(conn, channel_id, dry_run=False):
             execute_values(
                 cursor,
                 """
-                INSERT INTO message_reactions (channel_id, message_id, user_id, emoji, date)
+                INSERT INTO trank.message_reactions (channel_id, message_id, user_id, emoji, date)
                 VALUES %s
                 ON CONFLICT (channel_id, message_id, user_id, emoji) DO NOTHING
                 """,
@@ -217,9 +359,29 @@ def import_channel(conn, channel_id, dry_run=False):
                 page_size=1000,
             )
 
+        # Insert users using ON CONFLICT to handle duplicates
+        if all_users:
+            print(f"  💾 Inserting users...")
+            execute_values(
+                cursor,
+                """
+                INSERT INTO trank.channel_users (channel_id, user_id, username, first_name, last_name, bio, photo_id, is_admin)
+                VALUES %s
+                ON CONFLICT (channel_id, user_id) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name,
+                    bio = EXCLUDED.bio,
+                    photo_id = EXCLUDED.photo_id,
+                    is_admin = EXCLUDED.is_admin
+                """,
+                all_users,
+                page_size=1000,
+            )
+
         conn.commit()
         print(
-            f"  ✅ Successfully imported {len(all_messages)} messages and {len(all_reactions)} reactions"
+            f"  ✅ Successfully imported {len(all_messages)} messages, {len(all_reactions)} reactions, and {len(all_users)} users"
         )
 
     except Exception as e:
@@ -230,7 +392,7 @@ def import_channel(conn, channel_id, dry_run=False):
     finally:
         cursor.close()
 
-    return len(all_messages), len(all_reactions)
+    return len(all_messages), len(all_reactions), len(all_users)
 
 
 def main():
@@ -288,8 +450,21 @@ def main():
         print(f"❌ Error connecting to database: {e}")
         sys.exit(1)
 
+    # Load channel metadata
+    channels_metadata = load_channels_metadata()
+    if channels_metadata:
+        print(
+            f"📋 Loaded metadata for {len(channels_metadata)} channels from raw/channels.json\n"
+        )
+    else:
+        print(
+            "⚠️  No raw/channels.json found - run 'python list_channels.py' to generate it\n"
+        )
+
     total_messages = 0
     total_reactions = 0
+    total_users = 0
+    total_channels = 0
 
     try:
         for channel_id in channels:
@@ -297,13 +472,24 @@ def main():
             print(f"Channel: {channel_id}")
             print(f"{'=' * 60}")
 
-            messages_count, reactions_count = import_channel(
+            messages_count, reactions_count, users_count = import_channel(
                 conn, channel_id, dry_run=args.dry_run
             )
 
             total_messages += messages_count
             total_reactions += reactions_count
+            total_users += users_count
             print()
+
+        # Import channel metadata
+        if channels_metadata:
+            print(f"{'=' * 60}")
+            print("Importing channel metadata")
+            print(f"{'=' * 60}")
+            total_channels = import_channels(
+                conn, channels, channels_metadata, dry_run=args.dry_run
+            )
+            print(f"  ✅ Imported {total_channels} channel(s)\n")
 
     finally:
         conn.close()
@@ -311,8 +497,10 @@ def main():
     print(f"{'=' * 60}")
     print("📊 Summary")
     print(f"{'=' * 60}")
+    print(f"   Total channels: {total_channels}")
     print(f"   Total messages: {total_messages}")
     print(f"   Total reactions: {total_reactions}")
+    print(f"   Total users: {total_users}")
     if args.dry_run:
         print("   (Dry run - no data was inserted)")
     print()
