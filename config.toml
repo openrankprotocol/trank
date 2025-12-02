@@ -32,16 +32,16 @@ max_reply_depth = 4
 # List of group chat to crawl (must be numeric IDs, not usernames)
 # Use 'python list_channels.py' to see all your channels and their IDs
 include = [
-    2244967395, # Base LatAm
+    # 2244967395, # Base LatAm
     1242127973, # Lobster DAO
-    1533865579, # Decentralised.co
+    # 1533865579, # Decentralised.co
 ]
 
 [channels]
 # List of channel IDs to crawl (must be numeric IDs, not usernames)
 # Use 'python list_channels.py' to see all your channels and their IDs
 include = [
-    2468695644, # Ritual-Korea - Channel
+    # 2468695644, # Ritual-Korea - Channel
 ]
 
 [output]
