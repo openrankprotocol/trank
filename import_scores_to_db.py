@@ -2,7 +2,7 @@
 """
 Import Seeds and Scores to PostgreSQL
 
-Imports seed values from seed/[channel_id].csv and computed scores from output/[channel_id].csv
+Imports seed values from seed/[channel_id].csv and computed scores from scores/[channel_id].csv
 into PostgreSQL database.
 
 Usage:
@@ -106,7 +106,7 @@ def import_channel_scores(conn, channel_id, dry_run=False):
         tuple: (seeds_count, scores_count)
     """
     seed_file = Path("seed") / f"{channel_id}.csv"
-    output_file = Path("output") / f"{channel_id}.csv"
+    output_file = Path("scores") / f"{channel_id}.csv"
 
     seeds = load_csv_values(seed_file)
     scores = load_csv_values(output_file)
