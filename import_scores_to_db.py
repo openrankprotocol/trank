@@ -93,13 +93,14 @@ def load_csv_values(file_path):
     return values
 
 
-def import_channel_scores(conn, channel_id, dry_run=False):
+def import_channel_scores(conn, channel_id, days_back, dry_run=False):
     """
     Import seeds and scores for a single channel.
 
     Args:
         conn: Database connection
         channel_id: Channel ID to import
+        days_back: Number of days back used for this run (from time_window_days config)
         dry_run: If True, don't actually insert data
 
     Returns:
@@ -147,10 +148,10 @@ def import_channel_scores(conn, channel_id, dry_run=False):
         # Create a new run
         cursor.execute(
             """
-            INSERT INTO trank.runs (channel_id, run_id)
-            VALUES (%s, %s)
+            INSERT INTO trank.runs (channel_id, run_id, days_back)
+            VALUES (%s, %s, %s)
             """,
-            (int(channel_id), run_id),
+            (int(channel_id), run_id, days_back),
         )
         print(f"  🆕 Created run ID: {run_id}")
 
@@ -239,6 +240,7 @@ def main():
         group_chats = config.get("group_chats", {}).get("include", [])
         channels_list = config.get("channels", {}).get("include", [])
         channels = [str(ch) for ch in group_chats + channels_list]
+        days_back = config.get("crawler", {}).get("time_window_days", 0)
 
         if not channels:
             print("❌ Error: No channels configured in config.toml")
@@ -262,6 +264,21 @@ def main():
     total_seeds = 0
     total_scores = 0
 
+    # Get days_back from config or default to 0 for single channel mode
+    if not args.channel:
+        print(f"Using days_back from config: {days_back}")
+    else:
+        # For single channel mode, load config to get days_back
+        try:
+            config = load_config()
+            days_back = config.get("crawler", {}).get("time_window_days", 0)
+            print(f"Using days_back from config: {days_back}")
+        except FileNotFoundError:
+            days_back = 0
+            print("⚠️  Config not found, using days_back=0")
+
+    print()
+
     try:
         for channel_id in channels:
             print(f"{'=' * 60}")
@@ -269,7 +286,7 @@ def main():
             print(f"{'=' * 60}")
 
             seeds_count, scores_count = import_channel_scores(
-                conn, channel_id, dry_run=args.dry_run
+                conn, channel_id, days_back, dry_run=args.dry_run
             )
 
             total_seeds += seeds_count
