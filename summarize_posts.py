@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 model_name = "gpt-4.1-mini"
 
+
 def get_top_messages(
     db_url: str,
     channel_id: int,
@@ -23,6 +24,9 @@ def get_top_messages(
     """
     Fetch top messages for a single channel.
     If run_id is None, do not filter scores by run_id.
+
+    NOTE: We filter out messages whose text is NULL so we only summarize
+    messages that actually have content.
     """
     logger.debug(
         "Fetching top messages for channel_id=%s, run_id=%s, limit=%s",
@@ -93,6 +97,7 @@ def get_top_messages(
                 LEFT JOIN weighted w
                   ON w.message_id = m.id
                 WHERE m.channel_id = %s
+                  AND m.message IS NOT NULL
                 ORDER BY score DESC
                 LIMIT %s
             """
@@ -120,11 +125,28 @@ def summarize_with_openai(
 ) -> Dict[str, Any]:
     """
     Summarize messages using a shared OpenAI client.
+
+    Improvements:
+      - Filters out empty or very short messages to save tokens / noise.
+      - If there is no sufficiently long content, returns a "No Content" summary
+        and skips the OpenAI call.
+
     Retries if the response is not valid JSON or if OpenAI call fails.
     """
     logger.debug("Summarizing %d messages with OpenAI", len(messages))
 
-    messages_json = json.dumps(messages, ensure_ascii=False)
+    # Filter out empty or very short messages to save tokens/noise
+    valid_messages = [m for m in messages if m and len(m.strip()) > 5]
+
+    if not valid_messages:
+        logger.info("No valid messages to summarize; returning 'No Content' summary")
+        return {
+            "topic": "No Content",
+            "few_words": "No sufficient text data found",
+            "one_sentence": "There were no text interactions long enough to summarize.",
+        }
+
+    messages_json = json.dumps(valid_messages, ensure_ascii=False)
     prompt = (
         "Here are top messages as a JSON array:\n"
         f"{messages_json}\n\n"
@@ -218,7 +240,8 @@ def process_channel(
                     }
                 )
 
-            messages_to_summarize = [x["message"] for x in messages]
+            # Only pass non-empty messages through
+            messages_to_summarize = [x["message"] for x in messages if x["message"]]
             summary = summarize_with_openai(messages_to_summarize, client=client)
 
             logger.info("Finished processing channel_id=%s", channel_id)
