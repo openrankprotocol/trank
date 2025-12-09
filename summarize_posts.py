@@ -15,6 +15,48 @@ logger = logging.getLogger(__name__)
 model_name = "gpt-4.1-mini"
 
 
+summarization_instructions = """
+You are an expert analyst specializing in high-signal summarization of long, messy,
+and conversational text. Your job is to extract the most important ideas with
+maximum clarity and usefulness — **without referencing the existence of a conversation,
+participants, speakers, or dialogue**.
+
+Given the set of messages, produce a JSON object containing:
+
+1. "topic"
+   → A rich, multi-sentence thematic synthesis written in a direct, content-only style.
+   → Do NOT use phrases like “the conversation”, “participants”, “speakers”, “discussion”,
+     or anything that implies a transcript.
+   → Describe the ideas themselves:
+       - central debates and nuanced perspectives,
+       - motivations, risks, and implications,
+       - relationships between subtopics,
+       - underlying tensions, patterns, or insights.
+   → This should read like a concise research brief describing the subject matter, not
+     a report about a conversation.
+
+2. "few_words"
+   → 3–7 ultra-salient keywords or short phrases capturing the core ideas.
+   → Avoid generic terminology unless truly central.
+
+3. "one_sentence"
+   → One highly informative sentence that synthesizes the entire content.
+   → Must NOT reference a conversation or dialogue; instead directly state the core insight.
+
+Requirements:
+- Absolutely avoid meta-language such as “this conversation”, “they discuss”, 
+  “participants mention”, “the dialogue covers”, etc.
+- Be specific, concrete, and insight-driven.
+- Capture the “why”, not just the “what”.
+- Highlight notable viewpoints, disagreements, or unresolved questions.
+- If the content mentions individuals, projects, or mechanisms, include their significance.
+- Write for an expert audience; do not oversimplify.
+
+Return only the JSON object, nothing else.
+"""
+
+
+
 def get_top_messages(
     db_url: str,
     channel_id: int,
@@ -109,9 +151,7 @@ def get_top_messages(
 
             cur.execute(query, params)
             rows = cur.fetchall()
-            logger.debug(
-                "Fetched %d messages for channel_id=%s", len(rows), channel_id
-            )
+            logger.debug("Fetched %d messages for channel_id=%s", len(rows), channel_id)
             return rows
     finally:
         conn.close()
@@ -135,26 +175,14 @@ def summarize_with_openai(
     """
     logger.debug("Summarizing %d messages with OpenAI", len(messages))
 
-    # Filter out empty or very short messages to save tokens/noise
     valid_messages = [m for m in messages if m and len(m.strip()) > 5]
 
     if not valid_messages:
-        logger.info("No valid messages to summarize; returning 'No Content' summary")
-        return {
-            "topic": "No Content",
-            "few_words": "No sufficient text data found",
-            "one_sentence": "There were no text interactions long enough to summarize.",
-        }
+        logger.info("No valid messages to summarize; returning None")
+        return None
 
     messages_json = json.dumps(valid_messages, ensure_ascii=False)
-    prompt = (
-        "Here are top messages as a JSON array:\n"
-        f"{messages_json}\n\n"
-        "Return only a JSON object with the following fields:\n"
-        "topic: a 1-3 word description of the main topic\n"
-        "few_words: 1-7 words summarizing the content\n"
-        "one_sentence: one very concise sentence summarizing the discussion"
-    )
+    prompt = "Conversation:\n" f"{messages_json}"
 
     last_error: Optional[Exception] = None
 
@@ -165,10 +193,24 @@ def summarize_with_openai(
                 model=model_name,
                 input=prompt,
                 temperature=0.1,
-                instructions=(
-                    "You summarize discussions into a short JSON object "
-                    "and return JSON not markdown."
-                ),
+                instructions=summarization_instructions,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "channel_summary",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "topic": {"type": "string"},
+                                "few_words": {"type": "string"},
+                                "one_sentence": {"type": "string"},
+                            },
+                            "required": ["topic", "few_words", "one_sentence"],
+                            "additionalProperties": False,
+                        },
+                        "strict": True,
+                    }
+                },
             )
             content = resp.output_text.strip()
             logger.debug("OpenAI raw response text: %s", content[:500])
@@ -182,7 +224,7 @@ def summarize_with_openai(
                 e,
             )
             if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
+                delay = base_delay * (2**attempt)
                 logger.debug("Sleeping for %s seconds before retry", delay)
                 time.sleep(delay)
 
@@ -259,10 +301,8 @@ def process_channel(
                 e,
             )
             if attempt < max_retries - 1:
-                delay = 1.0 * (2 ** attempt)
-                logger.debug(
-                    "Channel %s retrying after %s seconds", channel_id, delay
-                )
+                delay = 1.0 * (2**attempt)
+                logger.debug("Channel %s retrying after %s seconds", channel_id, delay)
                 time.sleep(delay)
 
     logger.error(
@@ -285,9 +325,15 @@ def save_summaries(db_url, results, run_id, limit, model):
                 for item in results:
                     if "summary" not in item:
                         continue
+                    s = item["summary"]
+                    if s is None:
+                        logger.info(
+                            "Skipping channel_id=%s because summary is None",
+                            item.get("channel"),
+                        )
+                        continue
 
                     channel_id = str(item["channel"])
-                    s = item["summary"] or {}
                     topic = s.get("topic")
                     few_words = s.get("few_words")
                     one_sentence = s.get("one_sentence")
@@ -466,7 +512,7 @@ def main() -> None:
         help="Channel ID (repeat this flag for multiple channels)",
     )
     parser.add_argument("--run-id", type=int, required=False)
-    parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--limit", type=int, default=50)
     args = parser.parse_args()
 
     url = os.getenv("DATABASE_URL")
