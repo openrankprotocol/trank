@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 import os
 import psycopg2
-import argparse
 import json
 import time
 import logging
-from typing import List, Optional, Dict, Any
-
+from typing import List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
-
 model_name = "gpt-4.1-mini"
-
 
 summarization_instructions = """
 You are an expert analyst specializing in high-signal summarization of long, messy,
@@ -55,45 +51,44 @@ Requirements:
 Return only the JSON object, nothing else.
 """
 
-
-
-def get_top_messages(
-    db_url: str,
-    channel_id: int,
-    run_id: Optional[int],
-    limit: int,
-) -> List[tuple]:
-    """
-    Fetch top messages for a single channel.
-    If run_id is None, do not filter scores by run_id.
-
-    NOTE: We filter out messages whose text is NULL so we only summarize
-    messages that actually have content.
-    """
-    logger.debug(
-        "Fetching top messages for channel_id=%s, run_id=%s, limit=%s",
-        channel_id,
-        run_id,
-        limit,
-    )
-
+def fetch_all_channel_ids(db_url: str) -> List[int]:
     conn = psycopg2.connect(db_url)
     try:
         with conn.cursor() as cur:
-            run_id_filter = "AND s.run_id = %s" if run_id is not None else ""
+            cur.execute("SELECT DISTINCT channel_id FROM trank.messages;")
+            rows = cur.fetchall()
+            return [r[0] for r in rows]
+    finally:
+        conn.close()
 
-            query = f"""
-                WITH interaction AS (
+def get_top_messages(db_url: str, channel_id: int, limit: int) -> List[tuple]:
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            query = """
+                WITH latest_messages AS (
                     SELECT
-                        m.channel_id,
+                        id,
+                        channel_id,
+                        date,
+                        from_id,
+                        message
+                    FROM trank.messages
+                    WHERE channel_id = %s
+                      AND message IS NOT NULL
+                    ORDER BY date DESC, id DESC
+                    LIMIT 1000
+                ),
+                interaction AS (
+                    SELECT
+                        parent.channel_id,
                         parent.id AS message_id,
                         m.from_id AS user_id,
                         'reply' AS interaction_type
                     FROM trank.messages m
-                    JOIN trank.messages parent
-                        ON parent.channel_id = m.channel_id
-                       AND m.reply_to_msg_id = parent.id
-                    WHERE m.channel_id = %s
+                    JOIN latest_messages parent
+                      ON parent.channel_id = m.channel_id
+                     AND m.reply_to_msg_id = parent.id
                     UNION ALL
                     SELECT
                         r.channel_id,
@@ -101,7 +96,9 @@ def get_top_messages(
                         r.user_id,
                         'reaction' AS interaction_type
                     FROM trank.message_reactions r
-                    WHERE r.channel_id = %s
+                    JOIN latest_messages lm
+                      ON lm.channel_id = r.channel_id
+                     AND lm.id = r.message_id
                 ),
                 interaction_scores AS (
                     SELECT
@@ -111,9 +108,8 @@ def get_top_messages(
                         s.value AS user_score
                     FROM interaction i
                     JOIN trank.scores s
-                        ON s.channel_id = i.channel_id
-                       AND s.user_id = i.user_id
-                       {run_id_filter}
+                      ON s.channel_id = i.channel_id
+                     AND s.user_id = i.user_id
                 ),
                 weighted AS (
                     SELECT
@@ -129,66 +125,35 @@ def get_top_messages(
                     GROUP BY message_id
                 )
                 SELECT
-                    m.id,
-                    m.channel_id,
-                    m.date,
-                    m.from_id,
-                    m.message,
+                    lm.id,
+                    lm.channel_id,
+                    lm.date,
+                    lm.from_id,
+                    lm.message,
                     COALESCE(w.score, 0) AS score
-                FROM trank.messages m
+                FROM latest_messages lm
                 LEFT JOIN weighted w
-                  ON w.message_id = m.id
-                WHERE m.channel_id = %s
-                  AND m.message IS NOT NULL
+                  ON w.message_id = lm.id
                 ORDER BY score DESC
                 LIMIT %s
             """
-
-            if run_id is not None:
-                params = (channel_id, channel_id, run_id, channel_id, limit)
-            else:
-                params = (channel_id, channel_id, channel_id, limit)
-
-            cur.execute(query, params)
-            rows = cur.fetchall()
-            logger.debug("Fetched %d messages for channel_id=%s", len(rows), channel_id)
-            return rows
+            cur.execute(query, (channel_id, limit))
+            return cur.fetchall()
     finally:
         conn.close()
 
 
-def summarize_with_openai(
-    messages: List[str],
-    client: OpenAI,
-    max_retries: int = 3,
-    base_delay: float = 1.0,
-) -> Dict[str, Any]:
-    """
-    Summarize messages using a shared OpenAI client.
-
-    Improvements:
-      - Filters out empty or very short messages to save tokens / noise.
-      - If there is no sufficiently long content, returns a "No Content" summary
-        and skips the OpenAI call.
-
-    Retries if the response is not valid JSON or if OpenAI call fails.
-    """
-    logger.debug("Summarizing %d messages with OpenAI", len(messages))
-
-    valid_messages = [m for m in messages if m and len(m.strip()) > 5]
-
-    if not valid_messages:
-        logger.info("No valid messages to summarize; returning None")
+def summarize_with_openai(messages: List[str], client: OpenAI, max_retries: int = 3, base_delay: float = 1.0) -> Dict[str, Any]:
+    valid = [m for m in messages if m and len(m.strip()) > 5]
+    if not valid:
         return None
 
-    messages_json = json.dumps(valid_messages, ensure_ascii=False)
-    prompt = "Conversation:\n" f"{messages_json}"
-
-    last_error: Optional[Exception] = None
+    payload = json.dumps(valid, ensure_ascii=False)
+    prompt = "Conversation:\n" + payload
+    last_error = None
 
     for attempt in range(max_retries):
         try:
-            logger.debug("OpenAI summarize attempt %d/%d", attempt + 1, max_retries)
             resp = client.responses.create(
                 model=model_name,
                 input=prompt,
@@ -203,298 +168,103 @@ def summarize_with_openai(
                             "properties": {
                                 "topic": {"type": "string"},
                                 "few_words": {"type": "string"},
-                                "one_sentence": {"type": "string"},
+                                "one_sentence": {"type": "string"}
                             },
                             "required": ["topic", "few_words", "one_sentence"],
-                            "additionalProperties": False,
+                            "additionalProperties": False
                         },
-                        "strict": True,
+                        "strict": True
                     }
                 },
             )
-            content = resp.output_text.strip()
-            logger.debug("OpenAI raw response text: %s", content[:500])
-            return json.loads(content)
+            return json.loads(resp.output_text.strip())
         except Exception as e:
             last_error = e
-            logger.warning(
-                "OpenAI summarize failed on attempt %d/%d: %s",
-                attempt + 1,
-                max_retries,
-                e,
-            )
             if attempt < max_retries - 1:
-                delay = base_delay * (2**attempt)
-                logger.debug("Sleeping for %s seconds before retry", delay)
-                time.sleep(delay)
+                time.sleep(base_delay * (2**attempt))
 
-    logger.error(
-        "OpenAI summarization failed after %d attempts: %s",
-        max_retries,
-        last_error,
-    )
     return {
         "topic": None,
         "few_words": None,
         "one_sentence": None,
-        "error": f"Failed to summarize after {max_retries} attempts: {last_error}",
+        "error": f"Failed after {max_retries} attempts: {last_error}"
     }
 
-
-def process_channel(
-    db_url: str,
-    channel_id: int,
-    run_id: Optional[int],
-    limit: int,
-    client: OpenAI,
-    max_retries: int = 2,
-) -> Dict[str, Any]:
-    """
-    Process a single channel: fetch top messages and summarize.
-    Retries the whole processing a few times on failure.
-    """
-    logger.info("Processing channel_id=%s", channel_id)
-    last_error: Optional[Exception] = None
+def process_channel(db_url: str, channel_id: int, limit: int, client: OpenAI, max_retries: int = 2) -> Dict[str, Any]:
+    last_error = None
 
     for attempt in range(max_retries):
         try:
-            logger.debug(
-                "Channel %s processing attempt %d/%d",
-                channel_id,
-                attempt + 1,
-                max_retries,
-            )
-            rows = get_top_messages(db_url, channel_id, run_id, limit)
-            messages: List[Dict[str, Any]] = []
-            for r in rows:
-                messages.append(
-                    {
-                        "id": r[0],
-                        "channel_id": r[1],
-                        "date": (
-                            r[2].isoformat()
-                            if hasattr(r[2], "isoformat")
-                            else str(r[2])
-                        ),
-                        "from_id": r[3],
-                        "message": r[4],
-                        "score": r[5],
-                    }
-                )
-
-            # Only pass non-empty messages through
-            messages_to_summarize = [x["message"] for x in messages if x["message"]]
-            summary = summarize_with_openai(messages_to_summarize, client=client)
-
-            logger.info("Finished processing channel_id=%s", channel_id)
-            return {
-                "channel": channel_id,
-                "summary": summary,
-            }
+            rows = get_top_messages(db_url, channel_id, limit)
+            msgs = [r[4] for r in rows if r[4]]
+            summary = summarize_with_openai(msgs, client)
+            return {"channel": channel_id, "summary": summary}
         except Exception as e:
             last_error = e
-            logger.warning(
-                "Failed to process channel_id=%s on attempt %d/%d: %s",
-                channel_id,
-                attempt + 1,
-                max_retries,
-                e,
-            )
             if attempt < max_retries - 1:
-                delay = 1.0 * (2**attempt)
-                logger.debug("Channel %s retrying after %s seconds", channel_id, delay)
-                time.sleep(delay)
+                time.sleep(1.0 * (2**attempt))
 
-    logger.error(
-        "Failed to process channel_id=%s after %d attempts: %s",
-        channel_id,
-        max_retries,
-        last_error,
-    )
-    return {
-        "channel": channel_id,
-        "error": f"Failed to process channel after {max_retries} attempts: {last_error}",
-    }
+    return {"channel": channel_id, "error": str(last_error)}
 
-
-def save_summaries(db_url, results, run_id, limit, model):
+def save_summaries(db_url: str, results: List[Dict[str, Any]], limit: int, model: str):
     conn = psycopg2.connect(db_url)
     try:
         with conn:
             with conn.cursor() as cur:
                 for item in results:
-                    if "summary" not in item:
-                        continue
-                    s = item["summary"]
-                    if s is None:
-                        logger.info(
-                            "Skipping channel_id=%s because summary is None",
-                            item.get("channel"),
-                        )
+                    s = item.get("summary")
+                    if not s:
                         continue
 
-                    channel_id = str(item["channel"])
-                    topic = s.get("topic")
-                    few_words = s.get("few_words")
-                    one_sentence = s.get("one_sentence")
-                    error = s.get("error")
-
-                    if run_id is None:
-                        cur.execute(
-                            """
-                            INSERT INTO trank.channel_summaries (
-                                channel_id,
-                                run_id,
-                                messages_limit,
-                                summary,
-                                topic,
-                                few_words,
-                                one_sentence,
-                                error,
-                                model
-                            )
-                            VALUES (
-                                %s,
-                                NULL,
-                                %s,
-                                %s::jsonb,
-                                %s,
-                                %s,
-                                %s,
-                                %s,
-                                %s
-                            )
-                            ON CONFLICT (channel_id) WHERE run_id IS NULL DO UPDATE SET
-                                messages_limit = EXCLUDED.messages_limit,
-                                summary = EXCLUDED.summary,
-                                topic = EXCLUDED.topic,
-                                few_words = EXCLUDED.few_words,
-                                one_sentence = EXCLUDED.one_sentence,
-                                error = EXCLUDED.error,
-                                model = EXCLUDED.model,
-                                created_at = NOW();
-                            """,
-                            (
-                                channel_id,
-                                limit,
-                                json.dumps(s, ensure_ascii=False),
-                                topic,
-                                few_words,
-                                one_sentence,
-                                error,
-                                model,
-                            ),
+                    cur.execute(
+                        """
+                        INSERT INTO trank.channel_summaries (
+                            channel_id,
+                            summary,
+                            topic,
+                            few_words,
+                            one_sentence,
+                            error,
+                            model
                         )
-                    else:
-                        cur.execute(
-                            """
-                            INSERT INTO trank.channel_summaries (
-                                channel_id,
-                                run_id,
-                                messages_limit,
-                                summary,
-                                topic,
-                                few_words,
-                                one_sentence,
-                                error,
-                                model
-                            )
-                            VALUES (
-                                %s,
-                                %s,
-                                %s,
-                                %s::jsonb,
-                                %s,
-                                %s,
-                                %s,
-                                %s,
-                                %s
-                            )
-                            ON CONFLICT (channel_id, run_id) WHERE run_id IS NOT NULL DO UPDATE SET
-                                messages_limit = EXCLUDED.messages_limit,
-                                summary = EXCLUDED.summary,
-                                topic = EXCLUDED.topic,
-                                few_words = EXCLUDED.few_words,
-                                one_sentence = EXCLUDED.one_sentence,
-                                error = EXCLUDED.error,
-                                model = EXCLUDED.model,
-                                created_at = NOW();
-                            """,
-                            (
-                                channel_id,
-                                str(run_id),
-                                limit,
-                                json.dumps(s, ensure_ascii=False),
-                                topic,
-                                few_words,
-                                one_sentence,
-                                error,
-                                model,
-                            ),
-                        )
+                        VALUES (%s, %s::jsonb, %s, %s, %s, %s, %s)
+                        ON CONFLICT (channel_id) DO UPDATE SET
+                            summary     = EXCLUDED.summary,
+                            topic       = EXCLUDED.topic,
+                            few_words   = EXCLUDED.few_words,
+                            one_sentence= EXCLUDED.one_sentence,
+                            error       = EXCLUDED.error,
+                            model       = EXCLUDED.model,
+                            created_at  = NOW();
+                        """,
+                        (
+                            str(item["channel"]),
+                            json.dumps(s, ensure_ascii=False),
+                            s.get("topic"),
+                            s.get("few_words"),
+                            s.get("one_sentence"),
+                            s.get("error"),
+                            model,
+                        ),
+                    )
     finally:
         conn.close()
 
 
-def process_channels_concurrently(
-    db_url: str,
-    channel_ids: List[int],
-    run_id: Optional[int],
-    limit: int,
-    client: OpenAI,
-    max_workers: int = 10,
-) -> List[Dict[str, Any]]:
-    """
-    Process multiple channels concurrently in a thread pool.
-    Uses a shared OpenAI client instance across all workers.
-    """
-    logger.info(
-        "Processing %d channels concurrently with max_workers=%d",
-        len(channel_ids),
-        max_workers,
-    )
-    results: List[Dict[str, Any]] = []
-
+def process_channels_concurrently(db_url: str, channel_ids: List[int], limit: int, client: OpenAI, max_workers: int = 10) -> List[Dict[str, Any]]:
+    results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_channel = {
-            executor.submit(
-                process_channel,
-                db_url,
-                channel_id,
-                run_id,
-                limit,
-                client,
-            ): channel_id
-            for channel_id in channel_ids
+        fut = {
+            executor.submit(process_channel, db_url, cid, limit, client): cid
+            for cid in channel_ids
         }
-
-        for future in as_completed(future_to_channel):
-            channel_id = future_to_channel[future]
+        for f in as_completed(fut):
             try:
-                res = future.result()
+                results.append(f.result())
             except Exception as e:
-                logger.exception(
-                    "Unhandled error while processing channel_id=%s: %s",
-                    channel_id,
-                    e,
-                )
-                res = {
-                    "channel": channel_id,
-                    "error": str(e),
-                }
-            results.append(res)
-
-    logger.info("Finished processing all channels, uploading to db")
-    save_summaries(
-        db_url=db_url,
-        results=results,
-        run_id=run_id,
-        limit=limit,
-        model=model_name,
-    )
-    logger.info("Finished uploading to db")
+                results.append({"channel": fut[f], "error": str(e)})
+    save_summaries(db_url, results, limit, model_name)
     return results
-
 
 def main() -> None:
     logging.basicConfig(
@@ -502,34 +272,18 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--channel-id",
-        type=int,
-        action="append",
-        dest="channel_ids",
-        required=True,
-        help="Channel ID (repeat this flag for multiple channels)",
-    )
-    parser.add_argument("--run-id", type=int, required=False)
-    parser.add_argument("--limit", type=int, default=50)
-    args = parser.parse_args()
-
     url = os.getenv("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL environment variable is required")
 
+    limit = 50
+    max_workers = 5
+
     client = OpenAI()
-
-    results = process_channels_concurrently(
-        db_url=url,
-        channel_ids=args.channel_ids,
-        run_id=args.run_id,
-        limit=args.limit,
-        client=client,
-        max_workers=5,
-    )
-
+    channel_ids = fetch_all_channel_ids(url)
+    logger.info(f"Processing summaries for: {channel_ids}")
+    if channel_ids:
+        process_channels_concurrently(url, channel_ids, limit, client, max_workers)
 
 if __name__ == "__main__":
     main()
