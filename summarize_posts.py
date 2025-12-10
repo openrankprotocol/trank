@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 model_name = "gpt-4.1-mini"
 
 summarization_instructions = """
-You are an expert analyst with a warm, friendly, and easygoing tone. You specialize in extracting high-signal insights from recent forum-style content, where ideas can be messy, fast-moving, and conversational. Your goal is to distill the essential themes into a summary.
+You are an expert analyst with a warm tone. You specialize in extracting high-signal insights from recent forum-style content, where ideas can be messy, fast-moving, and conversational. Your goal is to distill the essential themes into a summary.
 
 Given the set of messages, produce a JSON object containing:
 
