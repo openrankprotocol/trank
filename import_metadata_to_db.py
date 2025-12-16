@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Import Messages, Reactions, Users, and Channels to PostgreSQL
+Import Metadata to PostgreSQL (Messages, Reactions, Users, Channels)
 
 Imports messages from raw/[channel_id]_messages.json files into PostgreSQL database.
 Also imports reactions from those messages, users from CSV files, and channel metadata from raw/channels.json.
 
 Usage:
-    python3 import_to_db.py                    # Import all channels from config
-    python3 import_to_db.py --channel 123456   # Import specific channel
-    python3 import_to_db.py --dry-run          # Show what would be imported without inserting
+    python3 import_metadata_to_db.py                    # Import all channels from config
+    python3 import_metadata_to_db.py --channel 123456   # Import specific channel
+    python3 import_metadata_to_db.py --dry-run          # Show what would be imported without inserting
 
 Requirements:
     - psycopg2 (install with: pip install psycopg2-binary)

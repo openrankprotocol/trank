@@ -10,9 +10,12 @@ Uses S3USERNAME and S3CREDENTIAL from .env file for AWS S3 authentication.
 - S3CREDENTIAL = AWS Secret Access Key
 
 Usage:
-    python3 upload_photos.py                    # Upload all photos
+    python3 upload_photos.py                    # Upload new photos (skips existing)
+    python3 upload_photos.py --file 123.jpg     # Upload a specific file
+    python3 upload_photos.py --force            # Re-upload all photos (overwrite existing)
     python3 upload_photos.py --dry-run          # Show what would be uploaded without uploading
-    python3 upload_photos.py --skip-existing    # Skip photos that already exist in S3
+    python3 upload_photos.py --check 123.jpg    # Check why an image might be missing
+    python3 upload_photos.py --check-all        # Check all user photos from database
 
 Requirements:
     - boto3 (install with: pip install boto3)
@@ -26,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import boto3
+import psycopg2
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
@@ -50,6 +54,15 @@ def get_credentials():
         sys.exit(1)
 
     return access_key, secret_key
+
+
+def get_db_connection():
+    """Get database connection from DATABASE_URL environment variable."""
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise ValueError("DATABASE_URL environment variable is required")
+
+    return psycopg2.connect(database_url)
 
 
 def create_s3_client(access_key: str, secret_key: str):
@@ -106,9 +119,201 @@ def upload_file(
         return (local_path.name, False, f"IO error: {e}")
 
 
+def check_file_status(
+    filename: str,
+    photos_dir: Path,
+):
+    """
+    Check the status of a file both locally and in S3.
+
+    Args:
+        filename: Filename to check (e.g., "123.jpg")
+        photos_dir: Path to the local photos directory
+    """
+    # Get credentials and create S3 client
+    access_key, secret_key = get_credentials()
+    s3_client = create_s3_client(access_key, secret_key)
+
+    # Normalize filename
+    if not filename.endswith(".jpg"):
+        filename = f"{filename}.jpg"
+
+    local_path = photos_dir / filename
+    s3_key = f"{S3_PREFIX}/{filename}"
+
+    print(f"🔍 Checking status for: {filename}\n")
+
+    # Check local file
+    print("📁 Local file:")
+    if local_path.exists():
+        size = local_path.stat().st_size
+        print(f"   ✅ Exists at: {local_path}")
+        print(f"   📏 Size: {size} bytes")
+    else:
+        print(f"   ❌ Not found at: {local_path}")
+        print(f"   💡 This user likely has no profile photo in Telegram")
+
+    # Check S3
+    print(f"\n☁️  S3 (s3://{S3_BUCKET}/{s3_key}):")
+    try:
+        response = s3_client.head_object(Bucket=S3_BUCKET, Key=s3_key)
+        print(f"   ✅ Exists in S3")
+        print(f"   📏 Size: {response.get('ContentLength')} bytes")
+        print(f"   📄 Content-Type: {response.get('ContentType')}")
+        print(f"   📅 Last Modified: {response.get('LastModified')}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "404":
+            print(f"   ❌ Not found in S3")
+            if not local_path.exists():
+                print(f"   💡 File doesn't exist locally, so it was never uploaded")
+            else:
+                print(f"   💡 File exists locally but hasn't been uploaded yet")
+                print(f"   💡 Run: python upload_photos.py --file {filename}")
+        else:
+            print(f"   ❌ Error: {e.response['Error']['Message']}")
+
+    # Show CloudFront URL
+    print(f"\n🌐 CloudFront URL:")
+    print(f"   https://d3n05cafj616pw.cloudfront.net/{s3_key}")
+
+    print()
+
+
+def check_all_files(photos_dir: Path):
+    """
+    Check status of all user photos from database.
+    Shows which users have photos locally, in S3, or missing entirely.
+    """
+    # Get credentials and create S3 client
+    access_key, secret_key = get_credentials()
+    s3_client = create_s3_client(access_key, secret_key)
+
+    # Get all user IDs from database
+    print("📊 Fetching user IDs from database...")
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT DISTINCT user_id FROM trank.channel_users ORDER BY user_id"
+        )
+        user_ids = [row[0] for row in cursor.fetchall()]
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"❌ Error connecting to database: {e}")
+        sys.exit(1)
+
+    print(f"   Found {len(user_ids)} unique users\n")
+
+    # Check each user
+    local_only = []
+    s3_only = []
+    both = []
+    neither = []
+
+    print("🔍 Checking files...")
+    for i, user_id in enumerate(user_ids):
+        filename = f"{user_id}.jpg"
+        local_path = photos_dir / filename
+        s3_key = f"{S3_PREFIX}/{filename}"
+
+        local_exists = local_path.exists()
+
+        # Check S3
+        try:
+            s3_client.head_object(Bucket=S3_BUCKET, Key=s3_key)
+            s3_exists = True
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "404":
+                s3_exists = False
+            else:
+                print(
+                    f"   ⚠️  Error checking {filename}: {e.response['Error']['Message']}"
+                )
+                s3_exists = False
+
+        if local_exists and s3_exists:
+            both.append(user_id)
+        elif local_exists and not s3_exists:
+            local_only.append(user_id)
+        elif not local_exists and s3_exists:
+            s3_only.append(user_id)
+        else:
+            neither.append(user_id)
+
+        # Progress update every 100 users
+        if (i + 1) % 100 == 0:
+            print(f"   Checked {i + 1}/{len(user_ids)} users...")
+
+    # Print summary
+    print(f"\n{'=' * 60}")
+    print("📊 Summary")
+    print(f"{'=' * 60}")
+    print(f"   Total users in database: {len(user_ids)}")
+    print(f"   ✅ In both local & S3:   {len(both)}")
+    print(f"   📁 Local only (not uploaded): {len(local_only)}")
+    print(f"   ☁️  S3 only (deleted locally): {len(s3_only)}")
+    print(f"   ❌ No photo (neither):   {len(neither)}")
+
+    # Show details for problematic cases
+    if local_only:
+        print(f"\n📁 Files to upload ({len(local_only)}):")
+        for user_id in local_only[:10]:
+            print(f"   - {user_id}.jpg")
+        if len(local_only) > 10:
+            print(f"   ... and {len(local_only) - 10} more")
+        print(f"   💡 Run: python upload_photos.py")
+
+    if neither:
+        print(f"\n❌ Users without photos ({len(neither)}):")
+        for user_id in neither[:10]:
+            print(f"   - {user_id}")
+        if len(neither) > 10:
+            print(f"   ... and {len(neither) - 10} more")
+        print(f"   💡 These users have no profile photo in Telegram")
+
+    print()
+
+
+def upload_single_file(
+    file_path: Path,
+    force: bool = False,
+    dry_run: bool = False,
+):
+    """
+    Upload a single specific file to S3.
+
+    Args:
+        file_path: Path to the file to upload
+        force: If True, upload even if file exists in S3
+        dry_run: If True, don't actually upload
+    """
+    # Get credentials and create S3 client
+    access_key, secret_key = get_credentials()
+    s3_client = create_s3_client(access_key, secret_key)
+
+    s3_key = f"{S3_PREFIX}/{file_path.name}"
+
+    # Check if file exists unless force is True
+    if not force and not dry_run:
+        if check_file_exists(s3_client, S3_BUCKET, s3_key):
+            print(f"⏭️  File already exists in S3: {file_path.name}")
+            print(f"   Use --force to overwrite")
+            return
+
+    filename, success, message = upload_file(
+        s3_client, file_path, S3_BUCKET, s3_key, dry_run
+    )
+
+    if success:
+        print(f"✅ {filename}: {message}")
+    else:
+        print(f"❌ {filename}: {message}")
+
+
 def upload_photos(
     photos_dir: Path,
-    skip_existing: bool = False,
+    force: bool = False,
     dry_run: bool = False,
     max_workers: int = 5,
 ):
@@ -117,7 +322,7 @@ def upload_photos(
 
     Args:
         photos_dir: Path to the directory containing photos
-        skip_existing: If True, skip files that already exist in S3
+        force: If True, re-upload all files (overwrite existing)
         dry_run: If True, don't actually upload, just show what would be done
         max_workers: Number of concurrent upload threads
     """
@@ -140,9 +345,9 @@ def upload_photos(
     skipped = 0
     failed = 0
 
-    # Filter out existing files if skip_existing is True
+    # Filter out existing files unless force is True
     photos_to_upload = []
-    if skip_existing and not dry_run:
+    if not force and not dry_run:
         print("🔍 Checking for existing files...")
         for i, photo in enumerate(photos):
             s3_key = f"{S3_PREFIX}/{photo.name}"
@@ -214,16 +419,42 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python3 upload_photos.py                    # Upload all photos
-    python3 upload_photos.py --skip-existing    # Skip existing files
+    python3 upload_photos.py                    # Upload new photos (skips existing)
+    python3 upload_photos.py --file 123.jpg     # Upload a specific file
+    python3 upload_photos.py --check 123.jpg    # Check why an image might be missing
+    python3 upload_photos.py --check-all        # Check all user photos from database
+    python3 upload_photos.py --force            # Re-upload all (overwrite existing)
     python3 upload_photos.py --dry-run          # Preview without uploading
     python3 upload_photos.py --workers 10       # Use 10 concurrent uploads
         """,
     )
     parser.add_argument(
+        "--file",
+        "-f",
+        type=str,
+        help="Upload a specific file (filename or path)",
+    )
+    parser.add_argument(
+        "--check",
+        "-c",
+        type=str,
+        help="Check status of a file (locally and in S3)",
+    )
+    parser.add_argument(
+        "--check-all",
+        action="store_true",
+        help="Check status of all user photos from database",
+    )
+    parser.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip photos that already exist in S3",
+        default=True,
+        help="Skip photos that already exist in S3 (default: True)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-upload all files, overwriting existing ones in S3",
     )
     parser.add_argument(
         "--dry-run",
@@ -244,6 +475,38 @@ Examples:
 
     # Find photos directory
     photos_dir = Path(__file__).parent / "raw" / "photos"
+
+    # Handle check mode
+    if args.check:
+        check_file_status(args.check, photos_dir)
+        return
+
+    # Handle check-all mode
+    if args.check_all:
+        check_all_files(photos_dir)
+        return
+
+    # Handle single file upload
+    if args.file:
+        file_path = Path(args.file)
+
+        # If just a filename, look in photos_dir
+        if not file_path.exists():
+            file_path = photos_dir / args.file
+
+        if not file_path.exists():
+            print(f"❌ Error: File not found: {args.file}")
+            print(f"   Looked in: {photos_dir}")
+            sys.exit(1)
+
+        upload_single_file(
+            file_path=file_path,
+            force=args.force,
+            dry_run=args.dry_run,
+        )
+        return
+
+    # Upload all photos
     if not photos_dir.exists():
         print(f"❌ Error: Photos directory not found: {photos_dir}")
         print("   Run download_photos.py first to download profile photos")
@@ -251,7 +514,7 @@ Examples:
 
     upload_photos(
         photos_dir=photos_dir,
-        skip_existing=args.skip_existing,
+        force=args.force,
         dry_run=args.dry_run,
         max_workers=args.workers,
     )

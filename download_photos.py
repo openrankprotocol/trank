@@ -10,6 +10,7 @@ Channels are loaded from config.toml.
 Usage:
     python3 download_photos.py                    # Download photos for channels in config.toml
     python3 download_photos.py --skip-existing    # Skip users who already have photos
+    python3 download_photos.py --verbose          # Show reasons for skipped photos
 
 Requirements:
     - telethon (install with: pip install telethon)
@@ -51,7 +52,10 @@ def load_config():
 
 
 async def download_photos_for_channel(
-    client: TelegramClient, channel_id: str, skip_existing: bool = False
+    client: TelegramClient,
+    channel_id: str,
+    skip_existing: bool = False,
+    verbose: bool = False,
 ):
     """
     Download profile photos for all users in a channel's user_ids.csv file.
@@ -62,14 +66,14 @@ async def download_photos_for_channel(
         skip_existing: If True, skip users who already have a photo downloaded
 
     Returns:
-        tuple: (downloaded_count, skipped_count, failed_count)
+        tuple: (downloaded_count, skipped_count, failed_count, skip_reasons)
     """
     csv_file = Path("raw") / f"{channel_id}_user_ids.csv"
     photos_dir = Path("raw") / "photos"
 
     if not csv_file.exists():
         print(f"❌ User IDs file not found: {csv_file}")
-        return 0, 0, 0
+        return 0, 0, 0, {}
 
     # Create photos directory if it doesn't exist
     photos_dir.mkdir(parents=True, exist_ok=True)
@@ -88,6 +92,12 @@ async def download_photos_for_channel(
     downloaded = 0
     skipped = 0
     failed = 0
+    skip_reasons = {
+        "already_exists": [],
+        "no_photo": [],
+        "user_invalid": [],
+        "other": [],
+    }
 
     for i, user_id in enumerate(user_ids, 1):
         photo_path = photos_dir / f"{user_id}.jpg"
@@ -95,6 +105,7 @@ async def download_photos_for_channel(
         # Skip if photo already exists and skip_existing is True
         if skip_existing and photo_path.exists():
             skipped += 1
+            skip_reasons["already_exists"].append(user_id)
             continue
 
         try:
@@ -113,23 +124,32 @@ async def download_photos_for_channel(
             else:
                 # User has no profile photo
                 skipped += 1
+                skip_reasons["no_photo"].append(user_id)
+                print(f"   ⏭️  {user_id}: No profile photo (download returned None)")
 
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             failed += 1
-            print(f"   ⚠️  Timeout downloading photo for user {user_id}")
+            print(f"   ⚠️  {user_id}: {e}")
 
         except Exception as e:
-            failed += 1
-            if "user" in str(e).lower() and "invalid" in str(e).lower():
-                # User doesn't exist or is inaccessible
-                skipped += 1
-                failed -= 1  # Don't count as failed, just skipped
-            elif "flood" in str(e).lower() or "wait" in str(e).lower():
+            error_str = str(e).lower()
+            if "flood" in error_str or "wait" in error_str:
                 # Rate limited - wait longer
-                print(f"   ⚠️  Rate limited, waiting 30 seconds...")
+                print(f"   ⚠️  {user_id}: {e} - waiting 30 seconds...")
                 await asyncio.sleep(30)
+                failed += 1
+            elif "user" in error_str and "invalid" in error_str:
+                skipped += 1
+                skip_reasons["user_invalid"].append(user_id)
+                print(f"   ⏭️  {user_id}: {e}")
+            elif "no user" in error_str:
+                skipped += 1
+                skip_reasons["user_invalid"].append(user_id)
+                print(f"   ⏭️  {user_id}: {e}")
             else:
-                print(f"   ⚠️  Error downloading photo for user {user_id}: {e}")
+                failed += 1
+                skip_reasons["other"].append((user_id, str(e)))
+                print(f"   ⚠️  {user_id}: {e}")
 
         # Print progress every 10 users
         if i % 10 == 0 or i == len(user_ids):
@@ -140,7 +160,7 @@ async def download_photos_for_channel(
         # Delay to avoid rate limiting (increased from 0.1 to 0.5)
         await asyncio.sleep(0.5)
 
-    return downloaded, skipped, failed
+    return downloaded, skipped, failed, skip_reasons
 
 
 async def main():
@@ -152,6 +172,12 @@ async def main():
         "--skip-existing",
         action="store_true",
         help="Skip users who already have photos downloaded",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Show detailed reasons for skipped photos",
     )
 
     args = parser.parse_args()
@@ -194,6 +220,8 @@ async def main():
     print(f"Found {len(channels)} channel(s) in config.toml")
     if args.skip_existing:
         print("Mode: Skip existing photos")
+    if args.verbose:
+        print("Mode: Verbose logging enabled")
     print()
 
     # Connect to Telegram
@@ -206,19 +234,27 @@ async def main():
     total_downloaded = 0
     total_skipped = 0
     total_failed = 0
+    total_skip_reasons = {
+        "already_exists": [],
+        "no_photo": [],
+        "user_invalid": [],
+        "other": [],
+    }
 
     for channel_id in all_channels:
         print(f"{'=' * 60}")
         print(f"Channel: {channel_id}")
         print(f"{'=' * 60}")
 
-        downloaded, skipped, failed = await download_photos_for_channel(
-            client, str(channel_id), args.skip_existing
+        downloaded, skipped, failed, skip_reasons = await download_photos_for_channel(
+            client, str(channel_id), args.skip_existing, args.verbose
         )
 
         total_downloaded += downloaded
         total_skipped += skipped
         total_failed += failed
+        for key in total_skip_reasons:
+            total_skip_reasons[key].extend(skip_reasons.get(key, []))
 
         print(
             f"✅ Channel {channel_id}: Downloaded {downloaded}, Skipped {skipped}, Failed {failed}"
@@ -234,6 +270,12 @@ async def main():
     print(f"   Total skipped: {total_skipped}")
     print(f"   Total failed: {total_failed}")
     print(f"   Photos saved to: raw/photos/")
+    print()
+    print("📋 Skip reasons breakdown:")
+    print(f"   Already exists locally: {len(total_skip_reasons['already_exists'])}")
+    print(f"   No profile photo set:   {len(total_skip_reasons['no_photo'])}")
+    print(f"   Invalid/deleted user:   {len(total_skip_reasons['user_invalid'])}")
+    print(f"   Other errors:           {len(total_skip_reasons['other'])}")
     print()
 
 
