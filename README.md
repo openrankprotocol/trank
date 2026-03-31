@@ -1,6 +1,6 @@
 # Telegram Channel Crawler
 
-A simple Python tool to fetch and archive messages from Telegram channels using [Telethon](https://github.com/LonamiWebs/Telethon).
+A Python tool to fetch, archive, and analyze messages from Telegram channels and groups using [Telethon](https://github.com/LonamiWebs/Telethon). Includes trust scoring with OpenRank and database integration.
 
 ## Features
 
@@ -12,6 +12,10 @@ A simple Python tool to fetch and archive messages from Telegram channels using 
 - **Channel exclusion** - Skip unwanted channels (logs, bots, etc.)
 - **Checkpoints** - Automatically saves progress and allows resuming if interrupted
 - **JSON export** - Saves messages with full metadata
+- **Trust scoring** - Calculate trust scores using OpenRank algorithm
+- **Database integration** - Import data to PostgreSQL
+- **AI summarization** - Generate summaries using OpenAI
+- **Photo management** - Download and upload user profile photos to S3
 
 ## Quick Start
 
@@ -31,19 +35,23 @@ pip install -r requirements.txt
 
 ### 3. Setup Environment
 
-```bash
-# Copy sample environment file
-cp .sample.env .env
+Create a `.env` file with your credentials:
 
-# Edit .env and add your credentials
-nano .env
-```
-
-Your `.env` should contain:
 ```env
+# Required for Telegram
 TELEGRAM_APP_ID=12345678
 TELEGRAM_APP_HASH=abcdef1234567890abcdef1234567890
 TELEGRAM_PHONE=+1234567890
+
+# Optional: For database imports
+DATABASE_URL=postgresql://user:pass@localhost:5432/dbname
+
+# Optional: For S3 photo uploads
+S3USERNAME=your_aws_access_key_id
+S3CREDENTIAL=your_aws_secret_access_key
+
+# Optional: For AI summarization
+OPENAI_API_KEY=sk-...
 ```
 
 *Note: TELEGRAM_PHONE is optional - you'll be prompted if not set*
@@ -59,14 +67,14 @@ python list_channels.py
 This will show all channels with their IDs. Then edit `config.toml` to set which channels to crawl:
 
 ```toml
+[group_chats]
+include = [
+    1234567890,     # Group chat ID (from list_channels.py)
+]
+
 [channels]
 include = [
     -1001234567890,     # Channel ID (from list_channels.py)
-    -1003198190559,     # Another channel ID
-]
-
-exclude = [
-    -1001111111111,     # Channel IDs to skip
 ]
 ```
 
@@ -89,24 +97,153 @@ Edit `config.toml` to customize the crawler:
 
 ```toml
 [crawler]
-time_window_days = 3              # How many days back to fetch
-max_messages_per_channel = 2000   # Message limit per channel
-parallel_requests = 3             # Concurrent channels to process
+time_window_days = 365            # How many days back to fetch
+max_messages_per_channel = 40000  # Message limit per channel
+parallel_requests = 1             # Concurrent channels to process
 batch_size = 500                  # Number of messages to fetch per batch
 rate_limiting_delay = 0.5         # Delay between requests (seconds)
-checkpoint_interval = 100         # Save checkpoint every N messages (0 to disable)
+checkpoint_interval = 2000        # Save checkpoint every N messages (0 to disable)
 fetch_replies = true              # Fetch replies/comments to channel posts
-max_reply_depth = 2               # Maximum depth for nested replies (0-5 recommended)
+max_reply_depth = 4               # Maximum depth for nested replies (0-5 recommended)
+
+[group_chats]
+include = [1234567890]            # Group chat IDs to crawl
 
 [channels]
-include = [-1001234567890, -1003198190559]  # Channel IDs to crawl
-exclude = [-1001111111111]                   # Channel IDs to skip
+include = [-1001234567890]        # Channel IDs to crawl
 
 [output]
 pretty_print = true               # Format JSON nicely
 indent_spaces = 2                 # JSON indentation
 
-# Note: Messages are saved to raw/[channel_id]_messages.json
+[trust]
+mention_points = 50               # Points for direct mentions
+reply_points = 40                 # Points for replies
+reaction_points = 30              # Points for reactions
+```
+
+## Files
+
+### Main Scripts
+
+| Script | Description |
+|--------|-------------|
+| `read_messages.py` | Main crawler script - fetches messages from Telegram |
+| `list_channels.py` | List all accessible channels/groups with their IDs |
+| `list_admins.py` | List admins/moderators for configured channels (saves to CSV) |
+| `generate_trust.py` | Calculate trust scores from messages |
+| `process_scores.py` | Aggregate and normalize trust scores |
+| `process_seed.py` | Process seed CSV files with tier-based weighting |
+| `generate_json.py` | Generate JSON files for UI from seed/output data |
+
+### Database Scripts
+
+| Script | Description |
+|--------|-------------|
+| `import_metadata_to_db.py` | Import messages, reactions, users, channels to PostgreSQL |
+| `import_scores_to_db.py` | Import seeds and scores to PostgreSQL |
+
+### Photo Management
+
+| Script | Description |
+|--------|-------------|
+| `download_photos.py` | Download user profile photos to `raw/photos/` |
+| `upload_photos.py` | Upload photos to S3 (`s3://openrank-files/telegram`) |
+
+### AI Features
+
+| Script | Description |
+|--------|-------------|
+| `summarize_posts.py` | Generate AI summaries of posts using OpenAI |
+
+### Channel-Specific Scripts
+
+Located in `channel/` directory for channel-specific processing:
+
+| Script | Description |
+|--------|-------------|
+| `channel/read_channel_messages.py` | Channel-specific message fetching |
+| `channel/generate_channel_trust.py` | Channel-specific trust generation |
+| `channel/generate_channel_json.py` | Channel-specific JSON generation |
+
+### Pipeline
+
+| Script | Description |
+|--------|-------------|
+| `run_pipeline.sh` | Run complete pipeline: trust → OpenRank → scores → JSON |
+
+### Configuration Files
+
+| File | Description |
+|------|-------------|
+| `config.toml` | Main configuration file |
+| `.env` | Environment variables (credentials) |
+| `requirements.txt` | Python dependencies |
+
+## Directory Structure
+
+```
+trank/
+├── channel/          # Channel-specific scripts
+├── output/           # Processed output files
+├── raw/              # Raw data from Telegram
+│   ├── checkpoints/  # Checkpoint files for resuming
+│   └── photos/       # Downloaded user profile photos
+├── schemas/          # PostgreSQL schema files
+├── scores/           # Computed OpenRank scores
+├── seed/             # Seed values for trust computation
+├── trust/            # Trust edge files
+├── ui/               # JSON files for UI consumption
+└── tmp/              # Temporary files
+```
+
+## Common Commands
+
+```bash
+# List all your channels
+python list_channels.py
+
+# Run the crawler
+python read_messages.py
+
+# List admins/moderators (saves to CSV)
+python list_admins.py
+
+# Calculate trust scores
+python generate_trust.py
+
+# Process and normalize scores
+python process_scores.py
+
+# Generate UI JSON files
+python generate_json.py
+
+# Run complete pipeline
+./run_pipeline.sh
+
+# Run pipeline for channels (not group chats)
+./run_pipeline.sh --channel
+
+# Download user profile photos
+python download_photos.py
+python download_photos.py --skip-existing
+python download_photos.py --verbose
+
+# Upload photos to S3
+python upload_photos.py
+python upload_photos.py --dry-run
+python upload_photos.py --force
+
+# Import to database
+python import_metadata_to_db.py
+python import_metadata_to_db.py --channel 123456
+python import_metadata_to_db.py --dry-run
+
+python import_scores_to_db.py
+python import_scores_to_db.py --channel 123456
+
+# Generate AI summaries
+python summarize_posts.py
 ```
 
 ## Checkpoints
@@ -115,7 +252,7 @@ The crawler automatically saves checkpoints during message fetching to prevent d
 
 **How it works:**
 - Checkpoint files are created every N messages (configurable via `checkpoint_interval` in config.toml)
-- Default is every 100 messages
+- Default is every 2000 messages
 - If the script is interrupted, it will detect the checkpoint on next run and ask if you want to resume
 - Checkpoints are automatically deleted after successful completion
 - Set `checkpoint_interval = 0` to disable checkpoints
@@ -129,92 +266,114 @@ python read_messages.py
 #    Resume from checkpoint? (y/n):
 ```
 
-## Output
+## Output Format
 
-Messages are saved as JSON files in the `raw/` directory, named by channel ID:
-- `raw/-1001234567890_messages.json` - Channel messages
-- `raw/-1003198190559_messages.json` - Another channel messages
-- `raw/checkpoints/[channel_id]_checkpoint.json` - Checkpoint files (temporary)
+### Messages
 
-Each JSON file contains an array of simplified message objects with only essential fields:
+Messages are saved in the `raw/` directory:
+- Format: `raw/[channel_id]_messages.json`
+- One file per channel
+- Contains simplified message data (ID, date, user ID, text, reactions, replies)
 
+Example message:
 ```json
-[
-  {
-    "id": 9099,
-    "date": "2025-11-13T01:49:52+00:00",
-    "from_id": 526750941,
-    "message": "@lazovicff @dharmikumbhani",
-    "reply_to_msg_id": 9098,
-    "reactions": [
-      {
-        "user_id": 526750941,
-        "emoji": "👍"
-      },
-      {
-        "user_id": 123456789,
-        "emoji": "👍"
-      }
-    ],
-    "replies": 3
-  }
-]
+{
+  "id": 9099,
+  "date": "2025-11-13T01:49:52+00:00",
+  "from_id": 526750941,
+  "message": "@lazovicff @dharmikumbhani",
+  "reply_to_msg_id": 9098,
+  "reactions": [
+    {"user_id": 526750941, "emoji": "👍"},
+    {"user_id": 123456789, "emoji": "👍"}
+  ],
+  "replies_count": 3,
+  "replies_data": [...]
+}
 ```
 
-**Fields included:**
-- `id` - Message ID
-- `date` - Message timestamp (ISO format)
-- `from_id` - User ID who sent the message
-- `message` - Message text content
-- `reply_to_msg_id` - ID of message being replied to (if any)
-- `reactions` - Array of reactions with user ID and emoji
-- `replies_count` - Number of replies to this message
-- `replies_data` - Array of reply messages (if `fetch_replies = true`)
+### User Information
 
-**For channels with replies enabled:**
-When `fetch_replies = true` in config, each post will include a `replies_data` array containing all replies/comments with their reactions and user information. This is useful for channels with discussion groups enabled.
+- Format: `raw/[channel_id]_user_ids.csv`
+- Columns: `user_id,username,first_name,last_name`
+- Some users may not have usernames (this is normal on Telegram)
 
-**Nested replies:**
-Replies can have their own replies (threaded conversations). The `max_reply_depth` setting controls how many levels deep to fetch:
-- `0` = No replies fetched
-- `1` = Only direct replies to posts
-- `2` = Replies + replies to those replies (recommended)
-- `3+` = Deeper nesting (slower, more data)
+### Admin Lists
 
-Each reply in `replies_data` can contain its own `replies_data` array for nested conversations.
+- Format: `raw/[channel_id]_admins.csv`
+- Columns: `user_id,username,first_name,last_name`
+- Generated by running `python list_admins.py`
 
-## Files
+### Trust Scores
 
-- `read_messages.py` - Main crawler script (run this)
-- `list_channels.py` - List all accessible channels/groups
-- `list_admins.py` - List all admins/moderators for channels in config and save to CSV
-- `get_user_ids.py` - Get user ID to username mapping for all members
-- `generate_trust.py` - Calculate trust scores from messages
-- `login.py` - Setup guide and instructions
-- `config.toml` - Configuration file
-- `.env` - Environment variables (credentials)
-- `requirements.txt` - Python dependencies
+- `trust/[channel_id].csv` - Raw trust edges with user IDs (i,j,v format)
+- `scores/[channel_id].csv` - OpenRank computed scores
+- `output/[channel_id].csv` - Processed scores with display names or user IDs
 
-## Common Commands
+## Trust Score Workflow
+
+The complete trust scoring workflow:
+
+1. **Fetch messages**: `python read_messages.py`
+   - Saves messages to `raw/[channel_id]_messages.json`
+   - Saves user info to `raw/[channel_id]_user_ids.csv`
+
+2. **Generate trust edges**: `python generate_trust.py`
+   - Reads messages and calculates trust based on reactions, replies, and mentions
+   - Saves trust edges to `trust/[channel_id].csv` (format: `i,j,v`)
+
+3. **Compute OpenRank scores**: Uses external `openrank` CLI tool
+   ```bash
+   openrank compute-local-et trust/[channel_id].csv seed/[channel_id].csv \
+       --out-path=scores/[channel_id].csv --alpha=0.25 --delta=0.000001
+   ```
+
+4. **Process scores**: `python process_scores.py`
+   - Aggregates incoming trust for each user
+   - Converts user IDs to display names
+   - Normalizes scores
+   - Saves to `output/[channel_id].csv`
+
+5. **Generate JSON**: `python generate_json.py`
+   - Creates UI-ready JSON files in `ui/` directory
+
+**Or run everything at once:**
+```bash
+./run_pipeline.sh           # For group chats
+./run_pipeline.sh --channel # For channels
+```
+
+## Database Integration
+
+### Schema Files
+
+Located in `schemas/` directory:
+- `messages.sql` - Message storage
+- `reactions.sql` - Reaction data
+- `users.sql` - User information
+- `channels.sql` - Channel metadata
+- `runs.sql` - Processing run tracking
+- `seeds.sql` - Seed values
+- `scores.sql` - Computed scores
+- `summaries.sql` - AI-generated summaries
+
+### Importing Data
 
 ```bash
-# List all your channels
-python list_channels.py
+# Set DATABASE_URL in .env first
+export DATABASE_URL=postgresql://user:pass@localhost:5432/dbname
 
-# List admins/moderators for channels in config (saves to CSV)
-python list_admins.py
+# Import all metadata (messages, reactions, users, channels)
+python import_metadata_to_db.py
 
-# Get user ID to username mapping
-python get_user_ids.py
+# Import specific channel
+python import_metadata_to_db.py --channel 123456
 
-# Run the crawler
-python read_messages.py
+# Preview without inserting
+python import_metadata_to_db.py --dry-run
 
-# Calculate trust scores
-python generate_trust.py
-
-# View setup guide
-python login.py
+# Import seeds and scores
+python import_scores_to_db.py
 ```
 
 ## Troubleshooting
@@ -232,7 +391,7 @@ python login.py
 → You're rate limited. Increase `rate_limiting_delay` in config.toml
 
 **Script keeps getting interrupted**
-→ Enable checkpoints in config.toml with `checkpoint_interval = 100` to save progress periodically
+→ Enable checkpoints in config.toml with `checkpoint_interval = 2000` to save progress periodically
 
 **Want to restart from scratch (ignore checkpoint)**
 → When prompted to resume, type 'n' or manually delete checkpoint files in `raw/checkpoints/`
@@ -246,80 +405,11 @@ python login.py
 **"Collected info for 0 unique users" for channel posts**
 → This is normal for channels (not groups). Set `fetch_replies = true` in config.toml to fetch comments/replies where user interactions happen.
 
-## Admin Listing
+**Database connection failed**
+→ Check that DATABASE_URL is set correctly in `.env`
 
-List and export channel/group administrators and their roles:
-
-```bash
-python list_admins.py
-```
-
-**What it does:**
-- Shows all owners, admins, and moderators for channels configured in `config.toml`
-- Displays their roles, permissions, and user information
-- Automatically saves admin lists to `raw/[channel_id]_admins.csv`
-
-**Output CSV format:**
-```csv
-user_id,username,first_name,last_name
-123456789,john_doe,John,Doe
-987654321,jane_admin,Jane,Smith
-```
-
-**Use cases:**
-- Identify channel moderators and their permissions
-- Export admin lists for record-keeping
-- Compare admin structures across multiple channels
-
-## Trust Score Workflow
-
-The crawler supports generating trust scores based on user interactions:
-
-1. **Fetch messages**: `python read_messages.py`
-   - Saves messages to `raw/[channel_id]_messages.json`
-   - Saves user info to `raw/[channel_id]_user_ids.csv` (includes user_id, username, first_name, last_name)
-
-2. **Generate trust scores**: `python generate_trust.py`
-   - Reads messages and calculates trust based on reactions, replies, and mentions
-   - Saves raw trust edges to `trust/[channel_id].csv` with format: `i,j,v` (from_user_id, to_user_id, score)
-   - **Note**: Trust files now use user IDs, not usernames
-
-3. **Process scores**: `python process_scores.py`
-   - Aggregates incoming trust for each user
-   - Converts user IDs to display names by default (username > "first_name last_name" > user_id)
-   - Normalizes scores to 0-1000 range
-   - Saves to `output/[channel_id].csv`
-   - Use `--with-user-ids` flag to keep user IDs instead of converting to display names
-
-**Example workflow:**
-```bash
-python read_messages.py          # Fetch messages and user info
-python generate_trust.py         # Calculate trust edges (saves user IDs)
-python process_scores.py         # Convert to display names and normalize
-python process_scores.py --with-user-ids  # Keep user IDs in output
-```
-
-## Output Format
-
-Messages are saved in the `raw/` directory:
-- Format: `raw/[channel_id]_messages.json`
-- One file per channel
-- Contains simplified message data (ID, date, user ID, text, reactions, replies)
-- No unnecessary metadata included
-
-User information is saved as:
-- Format: `raw/[channel_id]_user_ids.csv`
-- Columns: `user_id,username,first_name,last_name`
-- Some users may not have usernames (this is normal on Telegram)
-
-Admin lists are saved as:
-- Format: `raw/[channel_id]_admins.csv`
-- Columns: `user_id,username,first_name,last_name`
-- Generated by running `python list_admins.py`
-
-Trust scores workflow:
-- `trust/[channel_id].csv` - Raw trust edges with user IDs (i,j,v format)
-- `output/[channel_id].csv` - Processed scores with display names or user IDs (i,v format)
+**S3 upload failed**
+→ Check that S3USERNAME and S3CREDENTIAL are set in `.env`
 
 ## Session Files
 
@@ -334,6 +424,7 @@ The crawler creates a `telegram_session.session` file to remember your login.
 - [Telethon GitHub](https://github.com/LonamiWebs/Telethon)
 - [Telegram API](https://core.telegram.org/api)
 - [Get API Credentials](https://my.telegram.org)
+- [OpenRank](https://github.com/openrank-community/openrank)
 
 ## License
 
